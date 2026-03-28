@@ -61,7 +61,6 @@
     inset 0 1px 4px rgba(0, 0, 0, 0.6),
     inset 0 0 12px rgba(0, 30, 0, 0.2),
     inset 0 -1px 0 rgba(40, 80, 40, 0.08);
-  overflow: hidden;
 }
 
 /* Top line: channel number — glowing digits */

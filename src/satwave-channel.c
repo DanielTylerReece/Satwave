@@ -10,6 +10,7 @@ struct _SatwaveChannel {
   char    *description;
   char    *category;
   char    *image_url;
+  char    *entity_type;
   gboolean is_favorite;
 };
 
@@ -96,6 +97,7 @@ satwave_channel_finalize (GObject *object)
   g_free (self->description);
   g_free (self->category);
   g_free (self->image_url);
+  g_free (self->entity_type);
 
   G_OBJECT_CLASS (satwave_channel_parent_class)->finalize (object);
 }
@@ -141,6 +143,7 @@ satwave_channel_new (const char *id,
                      const char *description,
                      const char *category,
                      const char *image_url,
+                     const char *entity_type,
                      gboolean    is_favorite)
 {
   SatwaveChannel *self = g_object_new (SATWAVE_TYPE_CHANNEL, NULL);
@@ -150,6 +153,7 @@ satwave_channel_new (const char *id,
   self->number = number;
   self->description = g_strdup (description);
   self->category = g_strdup (category);
+  self->entity_type = g_strdup (entity_type ? entity_type : "channel-linear");
   self->image_url = g_strdup (image_url);
   self->is_favorite = is_favorite;
   return self;
@@ -175,6 +179,9 @@ satwave_channel_get_category (SatwaveChannel *self) { return self->category; }
 
 const char *
 satwave_channel_get_image_url (SatwaveChannel *self) { return self->image_url; }
+
+const char *
+satwave_channel_get_entity_type (SatwaveChannel *self) { return self->entity_type; }
 
 gboolean
 satwave_channel_get_is_favorite (SatwaveChannel *self) { return self->is_favorite; }

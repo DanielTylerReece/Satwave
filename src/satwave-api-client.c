@@ -201,12 +201,14 @@ on_channels_response (GObject      *source,
     const char *desc = "";
     const char *category = "Uncategorized";
     const char *image_url = NULL;
+    const char *entity_type = "channel-linear";
     int number = 0;
 
     if (json_object_has_member (item, "entity")) {
       /* Edge Gateway format: { entity: { type, id, texts, images }, decorations: {...} } */
       JsonObject *entity = json_object_get_object_member (item, "entity");
       id = json_object_get_string_member_with_default (entity, "id", "");
+      entity_type = json_object_get_string_member_with_default (entity, "type", "channel-linear");
 
       if (json_object_has_member (entity, "texts")) {
         JsonObject *texts = json_object_get_object_member (entity, "texts");
@@ -293,7 +295,7 @@ on_channels_response (GObject      *source,
     g_autofree char *full_image_url = build_image_url (image_url, 240, 240);
 
     g_autoptr (SatwaveChannel) channel = satwave_channel_new (
-      id, guid, name, number, desc, category, full_image_url, FALSE);
+      id, guid, name, number, desc, category, full_image_url, entity_type, FALSE);
 
     g_list_store_append (store, channel);
   }
@@ -425,13 +427,14 @@ satwave_api_client_get_stream_url_async (SatwaveApiClient    *self,
   g_autoptr (GTask) task = g_task_new (self, cancellable, callback, user_data);
 
   const char *channel_id = satwave_channel_get_id (channel);
+  const char *channel_type = satwave_channel_get_entity_type (channel);
 
   g_autoptr (JsonBuilder) b = json_builder_new ();
   json_builder_begin_object (b);
     json_builder_set_member_name (b, "id");
     json_builder_add_string_value (b, channel_id);
     json_builder_set_member_name (b, "type");
-    json_builder_add_string_value (b, "channel-linear");
+    json_builder_add_string_value (b, channel_type);
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();

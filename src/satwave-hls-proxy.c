@@ -1,5 +1,6 @@
 #include "satwave-hls-proxy.h"
 #include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
 #include <string.h>
 
 /*
@@ -83,10 +84,12 @@ fetch_upstream (SatwaveHlsProxy *self,
   return bytes;
 }
 
-/* Rewrite HLS playlist: replace segment/key URLs to go through our proxy */
+/* Rewrite HLS playlist: replace segment/key URLs to go through our proxy.
+ * base_url is the directory URL of the playlist being rewritten (for relative resolution). */
 static char *
 rewrite_playlist (SatwaveHlsProxy *self,
-                  const char      *content)
+                  const char      *content,
+                  const char      *base_url)
 {
   GString *result = g_string_new (NULL);
   g_auto (GStrv) lines = g_strsplit (content, "\n", -1);
@@ -102,10 +105,30 @@ rewrite_playlist (SatwaveHlsProxy *self,
     }
 
     if (g_str_has_prefix (line, "#EXT-X-KEY:")) {
-      /* Rewrite key URI to our local proxy */
+      /* Extract key ID from URI and proxy through our /key/ handler.
+       * URI format: "https://api.edge-gateway.siriusxm.com/playback/key/v1/{keyId}" */
+      const char *uri_start = strstr (line, "URI=\"");
+      const char *key_id = "00000000-0000-0000-0000-000000000000";
+      if (uri_start) {
+        const char *key_path = strstr (uri_start, "/key/v1/");
+        if (key_path) {
+          key_path += 8; /* skip "/key/v1/" */
+          const char *key_end = strchr (key_path, '"');
+          if (key_end) {
+            g_autofree char *extracted = g_strndup (key_path, key_end - key_path);
+            /* Use extracted key ID in our proxy URL */
+            g_string_append_printf (result,
+              "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:%u/key/%s\"\n",
+              self->port, extracted);
+            goto next_line;
+          }
+        }
+      }
+      /* Fallback: default key */
       g_string_append_printf (result,
-        "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:%u/key/1\"\n",
-        self->port);
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:%u/key/%s\"\n",
+        self->port, key_id);
+      next_line: (void)0;
     } else if (line[0] != '#') {
       /* This is a URI line (segment or sub-playlist) */
       if (g_str_has_prefix (line, "http://") || g_str_has_prefix (line, "https://")) {
@@ -115,8 +138,8 @@ rewrite_playlist (SatwaveHlsProxy *self,
           "http://127.0.0.1:%u/proxy?url=%s\n",
           self->port, encoded);
       } else {
-        /* Relative URL — resolve against upstream base, then proxy */
-        g_autofree char *full = g_strconcat (self->upstream_base, line, NULL);
+        /* Relative URL — resolve against the base URL of THIS playlist */
+        g_autofree char *full = g_strconcat (base_url, line, NULL);
         g_autofree char *encoded = g_uri_escape_string (full, NULL, FALSE);
         g_string_append_printf (result,
           "http://127.0.0.1:%u/proxy?url=%s\n",
@@ -132,7 +155,7 @@ rewrite_playlist (SatwaveHlsProxy *self,
   return g_string_free (result, FALSE);
 }
 
-/* Handler: /key/1 — serve the AES decryption key */
+/* Handler: /key/{keyId} — fetch and serve AES decryption key from SXM API */
 static void
 handle_key_request (SoupServer        *server,
                     SoupServerMessage *msg,
@@ -140,14 +163,95 @@ handle_key_request (SoupServer        *server,
                     GHashTable        *query,
                     gpointer           user_data)
 {
-  (void)server; (void)path; (void)query;
+  (void)server; (void)query;
   SatwaveHlsProxy *self = SATWAVE_HLS_PROXY (user_data);
-  (void)self;
 
+  /* Extract key ID from path: /key/{keyId} */
+  const char *key_id = path + 5; /* skip "/key/" */
+  if (!key_id || !*key_id)
+    key_id = "00000000-0000-0000-0000-000000000000";
+
+  /* Check if it's the well-known default key */
+  if (g_strcmp0 (key_id, "1") == 0 ||
+      g_strcmp0 (key_id, "00000000-0000-0000-0000-000000000000") == 0) {
+    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
+    soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
+    soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
+    soup_server_message_set_response (msg, "application/octet-stream",
+                                      SOUP_MEMORY_COPY,
+                                      SXM_AES_KEY_RAW,
+                                      sizeof (SXM_AES_KEY_RAW));
+    soup_server_message_set_status (msg, 200, NULL);
+    return;
+  }
+
+  /* Fetch the key from the edge-gateway API */
+  g_autofree char *key_url = g_strdup_printf (
+    "https://api.edge-gateway.siriusxm.com/playback/key/v1/%s", key_id);
+
+  SoupMessage *key_msg = soup_message_new (SOUP_METHOD_GET, key_url);
+  SoupMessageHeaders *req_headers = soup_message_get_request_headers (key_msg);
+  soup_message_headers_replace (req_headers, "Accept", "application/json");
+  soup_message_headers_replace (req_headers, "x-sxm-tenant", "sxm");
+  soup_message_headers_replace (req_headers, "x-sxm-platform", "browser");
+
+  const char *token = satwave_auth_get_access_token (self->auth);
+  if (token) {
+    g_autofree char *bearer = g_strdup_printf ("Bearer %s", token);
+    soup_message_headers_replace (req_headers, "Authorization", bearer);
+  }
+
+  GError *error = NULL;
+  GBytes *bytes = soup_session_send_and_read (self->fetch_session, key_msg, NULL, &error);
+  g_object_unref (key_msg);
+
+  if (error || !bytes) {
+    g_warning ("Failed to fetch key %s: %s", key_id, error ? error->message : "no data");
+    g_clear_error (&error);
+    /* Fallback to default key */
+    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
+    soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
+    soup_server_message_set_response (msg, "application/octet-stream",
+                                      SOUP_MEMORY_COPY,
+                                      SXM_AES_KEY_RAW,
+                                      sizeof (SXM_AES_KEY_RAW));
+    soup_server_message_set_status (msg, 200, NULL);
+    return;
+  }
+
+  /* Parse JSON response: {"keyId":"...","key":"base64_key"} */
+  gsize size;
+  const char *data = g_bytes_get_data (bytes, &size);
+
+  g_autoptr (JsonParser) parser = json_parser_new ();
+  if (json_parser_load_from_data (parser, data, size, NULL)) {
+    JsonObject *obj = json_node_get_object (json_parser_get_root (parser));
+    const char *b64_key = json_object_get_string_member_with_default (obj, "key", NULL);
+
+    if (b64_key) {
+      gsize key_len = 0;
+      g_autofree guchar *raw_key = g_base64_decode (b64_key, &key_len);
+
+      if (raw_key && key_len == 16) {
+        SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
+        soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
+        soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
+        soup_server_message_set_response (msg, "application/octet-stream",
+                                          SOUP_MEMORY_COPY,
+                                          (const char *)raw_key, key_len);
+        soup_server_message_set_status (msg, 200, NULL);
+        g_bytes_unref (bytes);
+        return;
+      }
+    }
+  }
+
+  g_bytes_unref (bytes);
+
+  /* Last resort fallback */
+  g_warning ("Could not parse key response for %s, using default", key_id);
   SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
   soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
-  soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-
   soup_server_message_set_response (msg, "application/octet-stream",
                                     SOUP_MEMORY_COPY,
                                     SXM_AES_KEY_RAW,
@@ -182,7 +286,7 @@ handle_master_request (SoupServer        *server,
 
   /* Check if this is a playlist (text) or binary data */
   if (size > 0 && data[0] == '#') {
-    g_autofree char *rewritten = rewrite_playlist (self, data);
+    g_autofree char *rewritten = rewrite_playlist (self, data, self->upstream_base);
 
     SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
     soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
@@ -237,11 +341,10 @@ handle_proxy_request (SoupServer        *server,
 
   /* If it's a playlist, rewrite it; otherwise pass through */
   if (g_str_has_suffix (upstream, ".m3u8") || (size > 0 && data[0] == '#')) {
-    /* Update the base URL for relative resolution in this sub-playlist */
-    g_free (self->upstream_base);
-    self->upstream_base = url_base (upstream);
+    /* Compute base URL from THIS playlist's URL for correct relative resolution */
+    g_autofree char *this_base = url_base (upstream);
 
-    g_autofree char *rewritten = rewrite_playlist (self, data);
+    g_autofree char *rewritten = rewrite_playlist (self, data, this_base);
     soup_server_message_set_response (msg, "application/vnd.apple.mpegurl",
                                       SOUP_MEMORY_COPY,
                                       rewritten, strlen (rewritten));

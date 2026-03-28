@@ -15,10 +15,12 @@ SatwaveChannel *satwave_channel_new (const char *id,
                                      const char *description,
                                      const char *category,
                                      const char *image_url,
+                                     const char *entity_type,
                                      gboolean    is_favorite);
 
 const char     *satwave_channel_get_id          (SatwaveChannel *self);
 const char     *satwave_channel_get_guid        (SatwaveChannel *self);
+const char     *satwave_channel_get_entity_type (SatwaveChannel *self);
 const char     *satwave_channel_get_name        (SatwaveChannel *self);
 int             satwave_channel_get_number      (SatwaveChannel *self);
 const char     *satwave_channel_get_description (SatwaveChannel *self);

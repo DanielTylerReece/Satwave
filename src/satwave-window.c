@@ -324,7 +324,12 @@ on_stream_url_ready (GObject      *source,
 
   if (error) {
     g_warning ("Failed to get stream URL: %s", error->message);
-    AdwToast *toast = adw_toast_new (error->message);
+    const char *user_msg = "This channel is not available for streaming";
+    if (strstr (error->message, "not-found") || strstr (error->message, "not found"))
+      user_msg = "This channel is not currently available for streaming";
+    else if (strstr (error->message, "invalid-source"))
+      user_msg = "This channel cannot be played";
+    AdwToast *toast = adw_toast_new (user_msg);
     adw_toast_overlay_add_toast (ADW_TOAST_OVERLAY (self->toast_overlay), toast);
     return;
   }
