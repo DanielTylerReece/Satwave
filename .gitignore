@@ -1,0 +1,7 @@
+builddir/
+build/
+*.o
+*.so
+*~
+.cache/
+data/gschemas.compiled

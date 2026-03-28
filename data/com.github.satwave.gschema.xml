@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="com.github.satwave" path="/com/github/satwave/">
+    <key name="audio-quality" type="s">
+      <choices>
+        <choice value="small"/>
+        <choice value="medium"/>
+        <choice value="large"/>
+      </choices>
+      <default>'large'</default>
+      <summary>Audio quality</summary>
+      <description>HLS stream quality tier: small (~64k), medium (~128k), large (~256k)</description>
+    </key>
+    <key name="favorites" type="as">
+      <default>[]</default>
+      <summary>Favorite channel IDs</summary>
+    </key>
+    <key name="last-channel" type="s">
+      <default>''</default>
+      <summary>Last played channel ID</summary>
+    </key>
+    <key name="volume" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.8</default>
+      <summary>Playback volume</summary>
+    </key>
+    <key name="window-width" type="i">
+      <default>1000</default>
+      <summary>Window width</summary>
+    </key>
+    <key name="window-height" type="i">
+      <default>700</default>
+      <summary>Window height</summary>
+    </key>
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Whether window is maximized</summary>
+    </key>
+  </schema>
+</schemalist>

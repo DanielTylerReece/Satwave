@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/github/satwave">
+    <file>style.css</file>
+  </gresource>
+  <gresource prefix="/com/github/satwave/icons">
+    <file alias="scalable/apps/com.github.satwave.svg" preprocess="xml-stripblanks">icons/hicolor/scalable/apps/com.github.satwave.svg</file>
+  </gresource>
+</gresources>
