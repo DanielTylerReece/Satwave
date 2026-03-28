@@ -7,7 +7,7 @@ struct _SatwaveChannelStore {
   GtkFilterListModel *filtered;  /* Filtered view */
   GtkEveryFilter *filter;        /* Combined filter */
 
-  GtkStringFilter *search_filter;
+  GtkCustomFilter *search_filter;
   GtkCustomFilter *category_filter;
   GtkCustomFilter *favorites_filter;
 
@@ -31,6 +31,50 @@ category_filter_func (gpointer item,
     return TRUE;
 
   return g_strcmp0 (satwave_channel_get_category (channel), self->category) == 0;
+}
+
+static gboolean
+search_filter_func (gpointer item,
+                    gpointer user_data)
+{
+  SatwaveChannelStore *self = SATWAVE_CHANNEL_STORE (user_data);
+  SatwaveChannel *channel = SATWAVE_CHANNEL (item);
+
+  if (!self->search_text || self->search_text[0] == '\0')
+    return TRUE;
+
+  g_autofree char *search_lower = g_utf8_strdown (self->search_text, -1);
+
+  /* Match against channel name */
+  const char *name = satwave_channel_get_name (channel);
+  if (name) {
+    g_autofree char *name_lower = g_utf8_strdown (name, -1);
+    if (strstr (name_lower, search_lower))
+      return TRUE;
+  }
+
+  /* Match against channel number */
+  g_autofree char *num_str = g_strdup_printf ("%d", satwave_channel_get_number (channel));
+  if (strstr (num_str, self->search_text))
+    return TRUE;
+
+  /* Match against description */
+  const char *desc = satwave_channel_get_description (channel);
+  if (desc) {
+    g_autofree char *desc_lower = g_utf8_strdown (desc, -1);
+    if (strstr (desc_lower, search_lower))
+      return TRUE;
+  }
+
+  /* Match against category */
+  const char *cat = satwave_channel_get_category (channel);
+  if (cat) {
+    g_autofree char *cat_lower = g_utf8_strdown (cat, -1);
+    if (strstr (cat_lower, search_lower))
+      return TRUE;
+  }
+
+  return FALSE;
 }
 
 static gboolean
@@ -84,6 +128,11 @@ satwave_channel_store_init (SatwaveChannelStore *self)
   self->category_filter = gtk_custom_filter_new (category_filter_func, self, NULL);
   gtk_multi_filter_append (GTK_MULTI_FILTER (self->filter),
                            GTK_FILTER (g_object_ref (self->category_filter)));
+
+  /* Search filter */
+  self->search_filter = gtk_custom_filter_new (search_filter_func, self, NULL);
+  gtk_multi_filter_append (GTK_MULTI_FILTER (self->filter),
+                           GTK_FILTER (g_object_ref (self->search_filter)));
 
   /* Favorites filter */
   self->favorites_filter = gtk_custom_filter_new (favorites_filter_func, self, NULL);
@@ -161,10 +210,7 @@ satwave_channel_store_set_search_filter (SatwaveChannelStore *self,
   g_free (self->search_text);
   self->search_text = g_strdup (search);
 
-  /* For search, we re-use the category filter with a broader match */
-  /* A proper search would use GtkStringFilter on a GtkExpression,
-     but for simplicity we'll filter in the category filter func */
-  gtk_filter_changed (GTK_FILTER (self->category_filter),
+  gtk_filter_changed (GTK_FILTER (self->search_filter),
                       GTK_FILTER_CHANGE_DIFFERENT);
 }
 

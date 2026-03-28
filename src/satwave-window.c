@@ -767,6 +767,17 @@ on_player_error (SatwavePlayer *player,
 }
 
 static void
+on_np_art_clicked (GtkButton *button,
+                   gpointer   user_data)
+{
+  (void)button;
+  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
+
+  if (self->current_channel)
+    show_channel_detail (self, self->current_channel);
+}
+
+static void
 on_play_pause_clicked (GtkButton *button,
                        gpointer   user_data)
 {
@@ -1003,7 +1014,15 @@ build_now_playing_bar (SatwaveWindow *self)
   self->np_image = gtk_image_new_from_icon_name ("audio-x-generic-symbolic");
   gtk_image_set_pixel_size (GTK_IMAGE (self->np_image), 48);
   gtk_widget_add_css_class (self->np_image, "lcd-artwork");
-  gtk_box_append (GTK_BOX (start_box), self->np_image);
+
+  /* Wrap image in a button so clicking it opens channel detail */
+  GtkWidget *np_image_btn = gtk_button_new ();
+  gtk_button_set_child (GTK_BUTTON (np_image_btn), self->np_image);
+  gtk_widget_add_css_class (np_image_btn, "flat");
+  gtk_widget_add_css_class (np_image_btn, "np-art-button");
+  g_signal_connect (np_image_btn, "clicked",
+                    G_CALLBACK (on_np_art_clicked), self);
+  gtk_box_append (GTK_BOX (start_box), np_image_btn);
 
   /* Hidden labels — still updated for internal state */
   self->np_channel_label = gtk_label_new ("Not Playing");

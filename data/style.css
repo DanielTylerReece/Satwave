@@ -39,6 +39,13 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
+/* Clickable artwork button — no extra chrome */
+.np-art-button {
+  padding: 0;
+  min-width: 0;
+  min-height: 0;
+}
+
 /* Outer frame — dark bezel like a 90s car stereo */
 .lcd-display {
   background: linear-gradient(180deg, #222222 0%, #1a1a1a 30%, #111111 100%);
