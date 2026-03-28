@@ -1,5 +1,9 @@
 # Satwave
 
+> **Disclaimer:** Satwave is a 100% unofficial project and you use it at your own risk. It is designed to be used for personal use. It does not record but only plays music from an already licensed account. Similar to playing music over speakers from the radio directly. Using Satwave in any corporate setting, to attempt to pirate music, or to try to make a profit off your subscription may result in YOU getting in legal trouble.
+>
+> SiriusXM is a registered trademark of Sirius XM Holdings Inc. This project is not affiliated with, endorsed by, or sponsored by Sirius XM Holdings Inc. in any way.
+
 A native GTK4/libadwaita SiriusXM streaming client for Linux.
 
 Satwave lets you browse, search, and play SiriusXM channels from a native GNOME desktop application. It features a retro LCD-style now-playing display, channel artwork, favorites, and category browsing.
@@ -74,12 +78,6 @@ GSETTINGS_SCHEMA_DIR=data ./builddir/satwave
 ```bash
 meson install -C builddir
 ```
-
-## Disclaimer
-
-Satwave is a 100% unofficial project and you use it at your own risk. It is designed to be used for personal use. It does not record but only plays music from an already licensed account. Similar to playing music over speakers from the radio directly. Using Satwave in any corporate setting, to attempt to pirate music, or to try to make a profit off your subscription may result in YOU getting in legal trouble.
-
-SiriusXM is a registered trademark of Sirius XM Holdings Inc. This project is not affiliated with, endorsed by, or sponsored by Sirius XM Holdings Inc. in any way.
 
 ## License
 
