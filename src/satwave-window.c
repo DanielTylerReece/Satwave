@@ -6,6 +6,8 @@
 #include "satwave-channel.h"
 #include "satwave-channel-store.h"
 #include "satwave-login-dialog.h"
+#include "satwave-mpris.h"
+#include "satwave-call-monitor.h"
 #include "satwave-config.h"
 
 struct _SatwaveWindow {
@@ -17,6 +19,9 @@ struct _SatwaveWindow {
   SatwavePlayer        *player;
   SatwaveHlsProxy      *proxy;
   SatwaveChannelStore  *store;
+  SatwaveMpris         *mpris;
+  SatwaveCallMonitor   *call_monitor;
+  gboolean              paused_for_call;
   GSettings            *settings;
 
   /* Current state */
@@ -693,6 +698,32 @@ update_now_playing (SatwaveWindow *self)
     ? "media-playback-pause-symbolic"
     : "media-playback-start-symbolic";
   gtk_button_set_icon_name (GTK_BUTTON (self->play_button), icon);
+
+  /* Update MPRIS */
+  satwave_mpris_set_playback_status (self->mpris, satwave_player_is_playing (self->player));
+  if (self->current_channel) {
+    const char *np_title = gtk_label_get_text (GTK_LABEL (self->np_title_label));
+    const char *ch_name = satwave_channel_get_name (self->current_channel);
+    const char *art = satwave_channel_get_image_url (self->current_channel);
+
+    /* Split np_title into title/artist if it contains " - " */
+    g_autofree char *m_title = NULL;
+    g_autofree char *m_artist = NULL;
+    if (np_title && *np_title) {
+      const char *sep = strstr (np_title, " - ");
+      if (sep) {
+        m_title = g_strndup (np_title, sep - np_title);
+        m_artist = g_strdup (sep + 3);
+      } else {
+        m_title = g_strdup (np_title);
+      }
+    }
+
+    satwave_mpris_set_metadata (self->mpris,
+                                m_title ? m_title : ch_name,
+                                m_artist,
+                                ch_name, art);
+  }
 }
 
 /* ── Now-playing API polling ── */
@@ -838,6 +869,33 @@ on_player_eos (SatwavePlayer *player,
       self->api, self->current_channel,
       self->sequence_token, self->source_context_id,
       NULL, (GAsyncReadyCallback) on_stream_url_ready, self);
+  }
+}
+
+/* ── Call monitor callback ── */
+
+static void
+on_call_state_changed (gboolean call_active,
+                       gpointer user_data)
+{
+  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
+
+  if (call_active) {
+    if (satwave_player_is_playing (self->player)) {
+      g_message ("Call detected — pausing playback");
+      self->paused_for_call = TRUE;
+      satwave_player_pause (self->player);
+      AdwToast *toast = adw_toast_new ("Paused — call detected");
+      adw_toast_overlay_add_toast (ADW_TOAST_OVERLAY (self->toast_overlay), toast);
+    }
+  } else {
+    if (self->paused_for_call) {
+      g_message ("Call ended — resuming playback");
+      self->paused_for_call = FALSE;
+      satwave_player_resume (self->player);
+      AdwToast *toast = adw_toast_new ("Resumed — call ended");
+      adw_toast_overlay_add_toast (ADW_TOAST_OVERLAY (self->toast_overlay), toast);
+    }
   }
 }
 
@@ -1209,6 +1267,9 @@ satwave_window_dispose (GObject *object)
   g_clear_object (&self->player);
   g_clear_object (&self->proxy);
   g_clear_object (&self->store);
+  g_clear_object (&self->mpris);
+  satwave_call_monitor_free (self->call_monitor);
+  self->call_monitor = NULL;
   g_clear_object (&self->settings);
   g_clear_object (&self->current_channel);
   g_clear_pointer (&self->sequence_token, g_free);
@@ -1235,6 +1296,8 @@ satwave_window_init (SatwaveWindow *self)
   self->player = satwave_player_new ();
   self->proxy = satwave_hls_proxy_new (self->auth);
   self->store = satwave_channel_store_new ();
+  self->mpris = satwave_mpris_new (self->player);
+  self->call_monitor = satwave_call_monitor_new (on_call_state_changed, self);
 
   /* Connect player signals */
   g_signal_connect (self->player, "metadata-changed",

@@ -17,6 +17,7 @@ gst_base_dep  = dependency('gstreamer-base-1.0', version: '>= 1.22')
 soup_dep      = dependency('libsoup-3.0', version: '>= 3.4')
 json_dep      = dependency('json-glib-1.0', version: '>= 1.6')
 secret_dep    = dependency('libsecret-1', version: '>= 0.20')
+pw_dep        = dependency('libpipewire-0.3', version: '>= 0.3')
 
 conf_data = configuration_data()
 conf_data.set_quoted('APP_ID', 'com.github.satwave')
@@ -59,6 +60,8 @@ sources = files(
   'src/satwave-channel.c',
   'src/satwave-channel-store.c',
   'src/satwave-login-dialog.c',
+  'src/satwave-mpris.c',
+  'src/satwave-call-monitor.c',
 )
 
 executable('satwave',
@@ -73,6 +76,7 @@ executable('satwave',
     soup_dep,
     json_dep,
     secret_dep,
+    pw_dep,
   ],
   install: true,
 )
