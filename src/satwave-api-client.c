@@ -389,37 +389,91 @@ on_stream_url_response (GObject      *source,
     return;
   }
 
-  JsonObject *stream = json_array_get_object_element (streams, 0);
-  JsonArray *urls = json_object_get_array_member (stream, "urls");
+  /* Collect primary URL from each stream (xtra channels return multiple streams = tracks) */
+  guint n_streams = json_array_get_length (streams);
+  GPtrArray *url_array = g_ptr_array_new ();
 
-  /* Find primary URL */
-  const char *stream_url = NULL;
-  for (guint i = 0; i < json_array_get_length (urls); i++) {
-    JsonObject *url_obj = json_array_get_object_element (urls, i);
-    gboolean is_primary = json_object_get_boolean_member_with_default (url_obj, "isPrimary", FALSE);
-    const char *url = json_object_get_string_member_with_default (url_obj, "url", NULL);
+  for (guint s = 0; s < n_streams; s++) {
+    JsonObject *stream = json_array_get_object_element (streams, s);
+    JsonArray *urls = json_object_get_array_member (stream, "urls");
 
-    if (is_primary && url) {
-      stream_url = url;
-      break;
+    const char *best_url = NULL;
+    for (guint u = 0; u < json_array_get_length (urls); u++) {
+      JsonObject *url_obj = json_array_get_object_element (urls, u);
+      gboolean is_primary = json_object_get_boolean_member_with_default (url_obj, "isPrimary", FALSE);
+      const char *url = json_object_get_string_member_with_default (url_obj, "url", NULL);
+
+      if (is_primary && url) { best_url = url; break; }
+      if (!best_url && url) best_url = url;
     }
-    if (!stream_url && url)
-      stream_url = url;
+
+    if (best_url)
+      g_ptr_array_add (url_array, g_strdup (best_url));
   }
 
-  if (!stream_url) {
+  if (url_array->len == 0) {
+    g_ptr_array_unref (url_array);
     g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
                             "No stream URL found in response");
     return;
   }
 
-  g_debug ("Stream URL: %s", stream_url);
-  g_task_return_pointer (task, g_strdup (stream_url), g_free);
+  /* Log track names for debugging */
+  for (guint s = 0; s < n_streams; s++) {
+    JsonObject *stream = json_array_get_object_element (streams, s);
+    if (json_object_has_member (stream, "metadata")) {
+      JsonObject *meta = json_object_get_object_member (stream, "metadata");
+      if (json_object_has_member (meta, "xtra")) {
+        JsonObject *xtra = json_object_get_object_member (meta, "xtra");
+        const char *ch_name = json_object_get_string_member_with_default (xtra, "channelName", "");
+        if (json_object_has_member (xtra, "items")) {
+          JsonArray *items = json_object_get_array_member (xtra, "items");
+          if (json_array_get_length (items) > 0) {
+            JsonObject *item = json_array_get_object_element (items, 0);
+            const char *title = json_object_get_string_member_with_default (item, "name", "?");
+            const char *artist = json_object_get_string_member_with_default (item, "artistName", "?");
+            g_message ("  track[%u]: \"%s\" by %s [%s]", s, title, artist, ch_name);
+          }
+        }
+      }
+    }
+  }
+
+  SatwaveStreamInfo *info = g_new0 (SatwaveStreamInfo, 1);
+  info->n_urls = url_array->len;
+  g_ptr_array_add (url_array, NULL); /* NULL-terminate */
+  info->urls = (char **) g_ptr_array_free (url_array, FALSE);
+  info->sequence_token = g_strdup (
+    json_object_get_string_member_with_default (root, "sequenceToken", NULL));
+
+  /* Extract sourceContextId from first stream's xtra metadata */
+  JsonObject *first_stream = json_array_get_object_element (streams, 0);
+  if (json_object_has_member (first_stream, "metadata")) {
+    JsonObject *meta = json_object_get_object_member (first_stream, "metadata");
+    if (json_object_has_member (meta, "xtra")) {
+      JsonObject *xtra = json_object_get_object_member (meta, "xtra");
+      info->source_context_id = g_strdup (
+        json_object_get_string_member_with_default (xtra, "sourceContextId", NULL));
+    }
+  }
+
+  g_task_return_pointer (task, info, (GDestroyNotify) satwave_stream_info_free);
+}
+
+void
+satwave_stream_info_free (SatwaveStreamInfo *info)
+{
+  if (!info) return;
+  g_strfreev (info->urls);
+  g_free (info->sequence_token);
+  g_free (info->source_context_id);
+  g_free (info);
 }
 
 void
 satwave_api_client_get_stream_url_async (SatwaveApiClient    *self,
                                          SatwaveChannel      *channel,
+                                         const char          *sequence_token,
                                          GCancellable        *cancellable,
                                          GAsyncReadyCallback  callback,
                                          gpointer             user_data)
@@ -435,6 +489,10 @@ satwave_api_client_get_stream_url_async (SatwaveApiClient    *self,
     json_builder_add_string_value (b, channel_id);
     json_builder_set_member_name (b, "type");
     json_builder_add_string_value (b, channel_type);
+    if (sequence_token && *sequence_token) {
+      json_builder_set_member_name (b, "sequenceToken");
+      json_builder_add_string_value (b, sequence_token);
+    }
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
@@ -452,7 +510,65 @@ satwave_api_client_get_stream_url_async (SatwaveApiClient    *self,
   g_object_unref (msg);
 }
 
-char *
+void
+satwave_api_client_peek_async (SatwaveApiClient    *self,
+                               SatwaveChannel      *channel,
+                               const char          *sequence_token,
+                               const char          *source_context_id,
+                               GCancellable        *cancellable,
+                               GAsyncReadyCallback  callback,
+                               gpointer             user_data)
+{
+  g_autoptr (GTask) task = g_task_new (self, cancellable, callback, user_data);
+
+  const char *channel_id = satwave_channel_get_id (channel);
+  const char *channel_type = satwave_channel_get_entity_type (channel);
+
+  g_autoptr (JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+    json_builder_set_member_name (b, "id");
+    json_builder_add_string_value (b, channel_id);
+    json_builder_set_member_name (b, "type");
+    json_builder_add_string_value (b, channel_type);
+    json_builder_set_member_name (b, "hlsVersion");
+    json_builder_add_string_value (b, "V3");
+    json_builder_set_member_name (b, "mtcVersion");
+    json_builder_add_string_value (b, "V2");
+    if (sequence_token) {
+      json_builder_set_member_name (b, "sequenceToken");
+      json_builder_add_string_value (b, sequence_token);
+    }
+    if (source_context_id) {
+      json_builder_set_member_name (b, "sourceContextId");
+      json_builder_add_string_value (b, source_context_id);
+    }
+  json_builder_end_object (b);
+
+  g_autoptr (JsonGenerator) gen = json_generator_new ();
+  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autofree char *body = json_generator_to_data (gen, NULL);
+
+  SoupMessage *msg = make_auth_post (self->auth, "playback/play/v1/peek", body);
+  SoupSession *session = satwave_auth_get_session (self->auth);
+
+  soup_session_send_and_read_async (session, msg,
+                                    G_PRIORITY_DEFAULT,
+                                    cancellable,
+                                    on_stream_url_response,
+                                    g_object_ref (task));
+  g_object_unref (msg);
+}
+
+SatwaveStreamInfo *
+satwave_api_client_peek_finish (SatwaveApiClient  *self,
+                                GAsyncResult      *result,
+                                GError           **error)
+{
+  (void)self;
+  return g_task_propagate_pointer (G_TASK (result), error);
+}
+
+SatwaveStreamInfo *
 satwave_api_client_get_stream_url_finish (SatwaveApiClient  *self,
                                           GAsyncResult      *result,
                                           GError           **error)

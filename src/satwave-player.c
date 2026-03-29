@@ -18,6 +18,7 @@ enum {
   SIGNAL_STATE_CHANGED,
   SIGNAL_BUFFERING,
   SIGNAL_ERROR,
+  SIGNAL_EOS,
   N_SIGNALS
 };
 
@@ -117,6 +118,7 @@ on_bus_message (GstBus     *bus,
     g_debug ("End of stream");
     gst_element_set_state (self->playbin, GST_STATE_READY);
     self->is_playing = FALSE;
+    g_signal_emit (self, signals[SIGNAL_EOS], 0);
     g_signal_emit (self, signals[SIGNAL_STATE_CHANGED], 0);
     break;
 
@@ -182,6 +184,13 @@ satwave_player_class_init (SatwavePlayerClass *klass)
                   G_SIGNAL_RUN_LAST, 0,
                   NULL, NULL, NULL,
                   G_TYPE_NONE, 1, G_TYPE_STRING);
+
+  signals[SIGNAL_EOS] =
+    g_signal_new ("eos",
+                  G_TYPE_FROM_CLASS (klass),
+                  G_SIGNAL_RUN_LAST, 0,
+                  NULL, NULL, NULL,
+                  G_TYPE_NONE, 0);
 }
 
 static void

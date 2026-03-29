@@ -21,6 +21,10 @@ struct _SatwaveWindow {
 
   /* Current state */
   SatwaveChannel       *current_channel;
+  char                 *sequence_token;
+  char                 *source_context_id;
+  char               **stream_queue;      /* NULL-terminated URL array for xtra channels */
+  int                   stream_queue_idx;  /* Current position in queue */
   guint                 session_refresh_id;
   guint                 now_playing_poll_id;
 
@@ -72,8 +76,28 @@ static void load_channels (SatwaveWindow *self);
 static void show_login_dialog (SatwaveWindow *self);
 static void update_now_playing (SatwaveWindow *self);
 static void on_stream_url_ready (GObject *source, GAsyncResult *result, gpointer user_data);
+static void play_current_queue_item (SatwaveWindow *self);
 static void on_favorite_toggled (GtkButton *button, gpointer user_data);
 static void start_now_playing_poll (SatwaveWindow *self);
+
+/* ── Play current item from the stream queue ── */
+
+static void
+play_current_queue_item (SatwaveWindow *self)
+{
+  if (!self->stream_queue || !self->stream_queue[self->stream_queue_idx])
+    return;
+
+  const char *url = self->stream_queue[self->stream_queue_idx];
+
+  satwave_hls_proxy_set_upstream (self->proxy, url);
+
+  const char *channel_id = satwave_channel_get_id (self->current_channel);
+  g_autofree char *proxy_url = satwave_hls_proxy_get_url (self->proxy, channel_id);
+
+  g_debug ("Playing queue item %d: %s", self->stream_queue_idx, url);
+  satwave_player_play_uri (self->player, proxy_url);
+}
 
 /* ── Play a channel (used from card and detail dialog) ── */
 
@@ -86,10 +110,13 @@ play_channel (SatwaveWindow  *self,
            satwave_channel_get_id (channel));
 
   g_set_object (&self->current_channel, channel);
+  g_clear_pointer (&self->sequence_token, g_free);
+  g_clear_pointer (&self->source_context_id, g_free);
+  g_clear_pointer (&self->stream_queue, g_strfreev);
 
   satwave_api_client_get_stream_url_async (
     self->api, channel, NULL,
-    (GAsyncReadyCallback) on_stream_url_ready, self);
+    NULL, (GAsyncReadyCallback) on_stream_url_ready, self);
 }
 
 /* ── Channel detail dialog ── */
@@ -319,7 +346,7 @@ on_stream_url_ready (GObject      *source,
   SatwaveWindow *self = SATWAVE_WINDOW (user_data);
   g_autoptr (GError) error = NULL;
 
-  g_autofree char *stream_url = satwave_api_client_get_stream_url_finish (
+  SatwaveStreamInfo *info = satwave_api_client_get_stream_url_finish (
     self->api, result, &error);
 
   if (error) {
@@ -334,17 +361,34 @@ on_stream_url_ready (GObject      *source,
     return;
   }
 
-  /* Set the upstream URL on the HLS proxy */
-  satwave_hls_proxy_set_upstream (self->proxy, stream_url);
+  /* Store xtra channel state for auto-advance */
+  g_free (self->sequence_token);
+  self->sequence_token = g_strdup (info->sequence_token);
+  if (info->source_context_id) {
+    g_free (self->source_context_id);
+    self->source_context_id = g_strdup (info->source_context_id);
+  }
 
-  /* Play via local proxy — it handles auth injection and AES key serving */
-  const char *channel_id = satwave_channel_get_id (self->current_channel);
-  g_autofree char *proxy_url = satwave_hls_proxy_get_url (self->proxy, channel_id);
+  /* Store the stream URL queue (xtra channels may have multiple tracks) */
+  g_strfreev (self->stream_queue);
+  self->stream_queue = g_strdupv (info->urls);
+  self->stream_queue_idx = 0;
 
-  g_debug ("Playing via proxy: %s (upstream: %s)", proxy_url, stream_url);
-  satwave_player_play_uri (self->player, proxy_url);
+  g_message ("=== Got %d stream URLs (token=%s, ctx=%s) ===",
+             info->n_urls,
+             info->sequence_token ? "yes" : "no",
+             info->source_context_id ? "yes" : "no");
+  for (int i = 0; info->urls[i]; i++)
+    g_message ("  queue[%d]: ...%s", i,
+               strlen (info->urls[i]) > 60 ? info->urls[i] + strlen (info->urls[i]) - 60 : info->urls[i]);
+
+  /* Play the first item in the queue */
+  play_current_queue_item (self);
+
+  satwave_stream_info_free (info);
 
   /* Save last channel */
+  const char *channel_id = satwave_channel_get_id (self->current_channel);
   g_settings_set_string (self->settings, "last-channel", channel_id);
 
   update_now_playing (self);
@@ -767,6 +811,37 @@ on_player_error (SatwavePlayer *player,
 }
 
 static void
+on_player_eos (SatwavePlayer *player,
+               gpointer       user_data)
+{
+  (void)player;
+  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
+
+  if (!self->current_channel)
+    return;
+
+  /* Try next item in the current queue */
+  if (self->stream_queue) {
+    self->stream_queue_idx++;
+    if (self->stream_queue[self->stream_queue_idx]) {
+      g_message (">>> EOS — advancing to queue[%d]", self->stream_queue_idx);
+      play_current_queue_item (self);
+      return;
+    }
+  }
+
+  /* Queue exhausted — peek for next batch */
+  if (self->sequence_token && self->sequence_token[0] &&
+      self->source_context_id && self->source_context_id[0]) {
+    g_message (">>> EOS — queue exhausted, peeking for next batch");
+    satwave_api_client_peek_async (
+      self->api, self->current_channel,
+      self->sequence_token, self->source_context_id,
+      NULL, (GAsyncReadyCallback) on_stream_url_ready, self);
+  }
+}
+
+static void
 on_np_art_clicked (GtkButton *button,
                    gpointer   user_data)
 {
@@ -1136,6 +1211,9 @@ satwave_window_dispose (GObject *object)
   g_clear_object (&self->store);
   g_clear_object (&self->settings);
   g_clear_object (&self->current_channel);
+  g_clear_pointer (&self->sequence_token, g_free);
+  g_clear_pointer (&self->source_context_id, g_free);
+  g_clear_pointer (&self->stream_queue, g_strfreev);
 
   G_OBJECT_CLASS (satwave_window_parent_class)->dispose (object);
 }
@@ -1167,6 +1245,8 @@ satwave_window_init (SatwaveWindow *self)
                     G_CALLBACK (on_player_buffering), self);
   g_signal_connect (self->player, "error",
                     G_CALLBACK (on_player_error), self);
+  g_signal_connect (self->player, "eos",
+                    G_CALLBACK (on_player_eos), self);
 
   /* Set volume from settings */
   double vol = g_settings_get_double (self->settings, "volume");
