@@ -7,6 +7,7 @@ struct _SatwavePlayer {
   GstElement *playbin;
   GstBus     *bus;
   guint       bus_watch_id;
+  guint       retry_id;
   double      volume;
   gboolean    is_playing;
   char       *title;
@@ -30,9 +31,19 @@ static gboolean
 retry_play (gpointer user_data)
 {
   SatwavePlayer *self = SATWAVE_PLAYER (user_data);
+  self->retry_id = 0;
   g_debug ("Retrying playback...");
   gst_element_set_state (self->playbin, GST_STATE_PLAYING);
   return G_SOURCE_REMOVE;
+}
+
+static void
+cancel_retry (SatwavePlayer *self)
+{
+  if (self->retry_id > 0) {
+    g_source_remove (self->retry_id);
+    self->retry_id = 0;
+  }
 }
 
 static gboolean
@@ -98,7 +109,8 @@ on_bus_message (GstBus     *bus,
     g_signal_emit (self, signals[SIGNAL_ERROR], 0, err->message);
 
     gst_element_set_state (self->playbin, GST_STATE_READY);
-    g_timeout_add_seconds (3, retry_play, self);
+    if (self->retry_id == 0)
+      self->retry_id = g_timeout_add_seconds (3, retry_play, self);
 
     g_error_free (err);
     g_free (debug);
@@ -106,11 +118,8 @@ on_bus_message (GstBus     *bus,
   }
 
   case GST_MESSAGE_STATE_CHANGED: {
-    if (GST_MESSAGE_SRC (msg) == GST_OBJECT (self->playbin)) {
-      GstState old_state, new_state;
-      gst_message_parse_state_changed (msg, &old_state, &new_state, NULL);
+    if (GST_MESSAGE_SRC (msg) == GST_OBJECT (self->playbin))
       g_signal_emit (self, signals[SIGNAL_STATE_CHANGED], 0);
-    }
     break;
   }
 
@@ -133,6 +142,8 @@ static void
 satwave_player_dispose (GObject *object)
 {
   SatwavePlayer *self = SATWAVE_PLAYER (object);
+
+  cancel_retry (self);
 
   if (self->bus_watch_id > 0) {
     g_source_remove (self->bus_watch_id);
@@ -218,6 +229,12 @@ void
 satwave_player_play_uri (SatwavePlayer *self,
                          const char    *uri)
 {
+  cancel_retry (self);
+
+  /* New stream — old tags no longer apply */
+  g_clear_pointer (&self->title, g_free);
+  g_clear_pointer (&self->artist, g_free);
+
   gst_element_set_state (self->playbin, GST_STATE_READY);
   g_object_set (self->playbin, "uri", uri, NULL);
   gst_element_set_state (self->playbin, GST_STATE_PLAYING);
@@ -228,6 +245,7 @@ satwave_player_play_uri (SatwavePlayer *self,
 void
 satwave_player_pause (SatwavePlayer *self)
 {
+  cancel_retry (self);
   gst_element_set_state (self->playbin, GST_STATE_PAUSED);
   self->is_playing = FALSE;
   g_signal_emit (self, signals[SIGNAL_STATE_CHANGED], 0);
@@ -244,6 +262,7 @@ satwave_player_resume (SatwavePlayer *self)
 void
 satwave_player_stop (SatwavePlayer *self)
 {
+  cancel_retry (self);
   gst_element_set_state (self->playbin, GST_STATE_NULL);
   self->is_playing = FALSE;
 
@@ -271,6 +290,13 @@ double
 satwave_player_get_volume (SatwavePlayer *self)
 {
   return self->volume;
+}
+
+void
+satwave_player_clear_metadata (SatwavePlayer *self)
+{
+  g_clear_pointer (&self->title, g_free);
+  g_clear_pointer (&self->artist, g_free);
 }
 
 const char *

@@ -288,7 +288,8 @@ step3_password_auth (GTask *task)
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
-  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autoptr (JsonNode) gen_root = json_builder_get_root (b);
+  json_generator_set_root (gen, gen_root);
   g_autofree char *body = json_generator_to_data (gen, NULL);
 
   SoupMessage *msg = make_json_post ("identity/v1/identities/authenticate/password",
@@ -431,8 +432,11 @@ satwave_auth_login_async (SatwaveAuth         *self,
   ld->password = g_strdup (password);
   g_task_set_task_data (task, ld, login_data_free);
 
+  /* Dup before free — the restore path passes self->username as the
+   * argument, so freeing first reads freed memory */
+  char *username_copy = g_strdup (username);
   g_free (self->username);
-  self->username = g_strdup (username);
+  self->username = username_copy;
   self->authenticated = FALSE;
 
   /* Step 1: Register device */
@@ -461,7 +465,8 @@ satwave_auth_login_async (SatwaveAuth         *self,
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
-  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autoptr (JsonNode) gen_root = json_builder_get_root (b);
+  json_generator_set_root (gen, gen_root);
   g_autofree char *body = json_generator_to_data (gen, NULL);
 
   SoupMessage *msg = make_json_post ("device/v1/devices", NULL, body);

@@ -33,6 +33,12 @@ struct _SatwaveWindow {
   guint                 session_refresh_id;
   guint                 now_playing_poll_id;
 
+  /* Artwork: url → GdkTexture, avoids re-downloading and re-decoding on
+   * every grid rebind / metadata change */
+  GHashTable           *art_cache;
+  GCancellable         *np_art_cancellable;
+  char                 *np_art_url;       /* what the now-playing bar shows */
+
   /* Widgets — header */
   GtkWidget            *header_bar;
   GtkWidget            *search_button;
@@ -81,9 +87,96 @@ static void load_channels (SatwaveWindow *self);
 static void show_login_dialog (SatwaveWindow *self);
 static void update_now_playing (SatwaveWindow *self);
 static void on_stream_url_ready (GObject *source, GAsyncResult *result, gpointer user_data);
+static void on_peek_ready (GObject *source, GAsyncResult *result, gpointer user_data);
 static void play_current_queue_item (SatwaveWindow *self);
 static void on_favorite_toggled (GtkButton *button, gpointer user_data);
 static void start_now_playing_poll (SatwaveWindow *self);
+
+/* ── Cached artwork loading ── */
+
+typedef struct {
+  SatwaveWindow *self;   /* strong ref */
+  GtkWidget     *image;  /* strong ref */
+  char          *url;
+  int            pixel_size;
+} ArtRequest;
+
+static void
+art_request_free (ArtRequest *req)
+{
+  g_object_unref (req->self);
+  g_object_unref (req->image);
+  g_free (req->url);
+  g_free (req);
+}
+
+static void
+on_artwork_loaded (GObject      *source,
+                   GAsyncResult *result,
+                   gpointer      user_data)
+{
+  ArtRequest *req = user_data;
+  SoupSession *session = SOUP_SESSION (source);
+  g_autoptr (GError) error = NULL;
+
+  g_autoptr (GBytes) bytes = soup_session_send_and_read_finish (session, result, &error);
+  if (!error && bytes) {
+    g_autoptr (GdkTexture) texture = gdk_texture_new_from_bytes (bytes, NULL);
+    if (texture) {
+      /* Crude size cap; never reached with one texture per channel */
+      if (g_hash_table_size (req->self->art_cache) >= 512)
+        g_hash_table_remove_all (req->self->art_cache);
+      g_hash_table_replace (req->self->art_cache,
+                            g_strdup (req->url), g_object_ref (texture));
+
+      if (GTK_IS_IMAGE (req->image)) {
+        gtk_image_set_from_paintable (GTK_IMAGE (req->image), GDK_PAINTABLE (texture));
+        gtk_image_set_pixel_size (GTK_IMAGE (req->image), req->pixel_size);
+      }
+    }
+  }
+
+  art_request_free (req);
+}
+
+/* Sets the image from cache immediately, or resets it to the placeholder
+ * and fetches. The cancellable aborts the fetch (e.g. recycled grid cell). */
+static void
+load_artwork (SatwaveWindow *self,
+              const char    *url,
+              GtkWidget     *image,
+              int            pixel_size,
+              GCancellable  *cancellable)
+{
+  if (!url || !*url)
+    return;
+
+  GdkTexture *cached = g_hash_table_lookup (self->art_cache, url);
+  if (cached) {
+    gtk_image_set_from_paintable (GTK_IMAGE (image), GDK_PAINTABLE (cached));
+    gtk_image_set_pixel_size (GTK_IMAGE (image), pixel_size);
+    return;
+  }
+
+  gtk_image_set_from_icon_name (GTK_IMAGE (image), "audio-x-generic-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (image), pixel_size);
+
+  SoupMessage *msg = soup_message_new (SOUP_METHOD_GET, url);
+  if (!msg)
+    return;
+
+  ArtRequest *req = g_new0 (ArtRequest, 1);
+  req->self = g_object_ref (self);
+  req->image = g_object_ref (image);
+  req->url = g_strdup (url);
+  req->pixel_size = pixel_size;
+
+  soup_session_send_and_read_async (
+    satwave_auth_get_session (self->auth), msg,
+    G_PRIORITY_LOW, cancellable,
+    on_artwork_loaded, req);
+  g_object_unref (msg);
+}
 
 /* ── Play current item from the stream queue ── */
 
@@ -118,6 +211,13 @@ play_channel (SatwaveWindow  *self,
   g_clear_pointer (&self->sequence_token, g_free);
   g_clear_pointer (&self->source_context_id, g_free);
   g_clear_pointer (&self->stream_queue, g_strfreev);
+
+  /* Clear stale track info from the previous channel so the ticker shows
+   * only the new channel name until fresh metadata arrives */
+  satwave_player_clear_metadata (self->player);
+  gtk_label_set_text (GTK_LABEL (self->lcd_title_label), "");
+  gtk_label_set_text (GTK_LABEL (self->np_title_label), "");
+  update_now_playing (self);
 
   satwave_api_client_get_stream_url_async (
     self->api, channel, NULL,
@@ -161,27 +261,6 @@ on_dialog_play_clicked (GtkButton *button,
 }
 
 static void
-on_dialog_image_loaded (GObject      *source,
-                        GAsyncResult *result,
-                        gpointer      user_data)
-{
-  GtkWidget *image = GTK_WIDGET (user_data);
-  SoupSession *session = SOUP_SESSION (source);
-  g_autoptr (GError) error = NULL;
-
-  g_autoptr (GBytes) bytes = soup_session_send_and_read_finish (session, result, &error);
-  if (!error && bytes) {
-    g_autoptr (GdkTexture) texture = gdk_texture_new_from_bytes (bytes, NULL);
-    if (texture && GTK_IS_IMAGE (image)) {
-      gtk_image_set_from_paintable (GTK_IMAGE (image), GDK_PAINTABLE (texture));
-      gtk_image_set_pixel_size (GTK_IMAGE (image), 240);
-    }
-  }
-
-  g_object_unref (image);
-}
-
-static void
 show_channel_detail (SatwaveWindow  *self,
                      SatwaveChannel *channel)
 {
@@ -214,19 +293,8 @@ show_channel_detail (SatwaveWindow  *self,
   gtk_widget_add_css_class (image, "icon-dropshadow");
   gtk_box_append (GTK_BOX (box), image);
 
-  /* Load artwork async */
-  const char *img_url = satwave_channel_get_image_url (channel);
-  if (img_url && *img_url) {
-    SoupMessage *img_msg = soup_message_new (SOUP_METHOD_GET, img_url);
-    if (img_msg) {
-      g_object_ref (image);
-      soup_session_send_and_read_async (
-        satwave_auth_get_session (self->auth), img_msg,
-        G_PRIORITY_DEFAULT, NULL,
-        (GAsyncReadyCallback) on_dialog_image_loaded, image);
-      g_object_unref (img_msg);
-    }
-  }
+  /* Load artwork async (cached) */
+  load_artwork (self, satwave_channel_get_image_url (channel), image, 240, NULL);
 
   /* Channel number + category */
   g_autofree char *subtitle = g_strdup_printf ("CH %03d  •  %s",
@@ -344,15 +412,15 @@ on_channel_info_clicked (GtkButton *button,
 }
 
 static void
-on_stream_url_ready (GObject      *source,
-                     GAsyncResult *result,
-                     gpointer      user_data)
+process_stream_result (SatwaveWindow *self,
+                       GAsyncResult  *result,
+                       gboolean       from_peek)
 {
-  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
   g_autoptr (GError) error = NULL;
 
-  SatwaveStreamInfo *info = satwave_api_client_get_stream_url_finish (
-    self->api, result, &error);
+  SatwaveStreamInfo *info = from_peek
+    ? satwave_api_client_peek_finish (self->api, result, &error)
+    : satwave_api_client_get_stream_url_finish (self->api, result, &error);
 
   if (error) {
     g_warning ("Failed to get stream URL: %s", error->message);
@@ -379,27 +447,43 @@ on_stream_url_ready (GObject      *source,
   self->stream_queue = g_strdupv (info->urls);
   self->stream_queue_idx = 0;
 
-  g_message ("=== Got %d stream URLs (token=%s, ctx=%s) ===",
-             info->n_urls,
-             info->sequence_token ? "yes" : "no",
-             info->source_context_id ? "yes" : "no");
-  for (int i = 0; info->urls[i]; i++)
-    g_message ("  queue[%d]: ...%s", i,
-               strlen (info->urls[i]) > 60 ? info->urls[i] + strlen (info->urls[i]) - 60 : info->urls[i]);
+  g_debug ("=== Got %d stream URLs (token=%s, ctx=%s) ===",
+           info->n_urls,
+           info->sequence_token ? "yes" : "no",
+           info->source_context_id ? "yes" : "no");
 
   /* Play the first item in the queue */
   play_current_queue_item (self);
 
   satwave_stream_info_free (info);
 
-  /* Save last channel */
-  const char *channel_id = satwave_channel_get_id (self->current_channel);
-  g_settings_set_string (self->settings, "last-channel", channel_id);
-
   update_now_playing (self);
 
-  /* Start polling for song/artist metadata from SXM API */
-  start_now_playing_poll (self);
+  /* Channel selection only — a peek continues the same channel, so the
+   * saved last-channel and the metadata poll are already correct */
+  if (!from_peek) {
+    const char *channel_id = satwave_channel_get_id (self->current_channel);
+    g_settings_set_string (self->settings, "last-channel", channel_id);
+    start_now_playing_poll (self);
+  }
+}
+
+static void
+on_stream_url_ready (GObject      *source,
+                     GAsyncResult *result,
+                     gpointer      user_data)
+{
+  (void)source;
+  process_stream_result (SATWAVE_WINDOW (user_data), result, FALSE);
+}
+
+static void
+on_peek_ready (GObject      *source,
+               GAsyncResult *result,
+               gpointer      user_data)
+{
+  (void)source;
+  process_stream_result (SATWAVE_WINDOW (user_data), result, TRUE);
 }
 
 static void
@@ -432,39 +516,6 @@ on_favorite_toggled (GtkButton *button,
   }
 
   g_settings_set_value (self->settings, "favorites", g_variant_builder_end (&builder));
-}
-
-static void
-on_image_loaded (GObject      *source,
-                 GAsyncResult *result,
-                 gpointer      user_data)
-{
-  GtkWidget *image = GTK_WIDGET (user_data);
-  SoupSession *session = SOUP_SESSION (source);
-  g_autoptr (GError) error = NULL;
-
-  g_autoptr (GBytes) bytes = soup_session_send_and_read_finish (session, result, &error);
-
-  if (error || !bytes) {
-    g_object_unref (image);
-    return;
-  }
-
-  gsize size;
-  const guchar *data = g_bytes_get_data (bytes, &size);
-  if (size == 0) {
-    g_object_unref (image);
-    return;
-  }
-
-  /* Create a GdkTexture from the downloaded image data */
-  g_autoptr (GdkTexture) texture = gdk_texture_new_from_bytes (bytes, &error);
-  if (texture && GTK_IS_IMAGE (image)) {
-    gtk_image_set_from_paintable (GTK_IMAGE (image), GDK_PAINTABLE (texture));
-    gtk_image_set_pixel_size (GTK_IMAGE (image), 120);
-  }
-
-  g_object_unref (image);
 }
 
 static void
@@ -548,6 +599,12 @@ channel_grid_setup (GtkListItemFactory *factory,
   g_object_set_data (G_OBJECT (list_item), "info-btn", info_btn);
   g_object_set_data (G_OBJECT (list_item), "fav-btn", fav_btn);
   g_object_set_data (G_OBJECT (list_item), "play-btn", play_btn);
+
+  /* Connect once here — the callbacks read the channel from button data,
+   * which bind updates on every recycle */
+  g_signal_connect (play_btn, "clicked", G_CALLBACK (on_channel_card_clicked), user_data);
+  g_signal_connect (fav_btn, "clicked", G_CALLBACK (on_favorite_toggled), user_data);
+  g_signal_connect (info_btn, "clicked", G_CALLBACK (on_channel_info_clicked), user_data);
 }
 
 static void
@@ -577,58 +634,37 @@ channel_grid_bind (GtkListItemFactory *factory,
     ? "starred-symbolic" : "non-starred-symbolic";
   gtk_button_set_icon_name (GTK_BUTTON (fav_btn), fav_icon);
 
-  /* Connect signals (store channel ref on buttons) */
+  /* Update channel refs the click handlers read */
   g_object_set_data_full (G_OBJECT (play_btn), "channel",
                           g_object_ref (channel), g_object_unref);
-  g_signal_handlers_disconnect_by_func (play_btn, on_channel_card_clicked, self);
-  g_signal_connect (play_btn, "clicked", G_CALLBACK (on_channel_card_clicked), self);
-
   g_object_set_data_full (G_OBJECT (fav_btn), "channel",
                           g_object_ref (channel), g_object_unref);
-  g_signal_handlers_disconnect_by_func (fav_btn, on_favorite_toggled, self);
-  g_signal_connect (fav_btn, "clicked", G_CALLBACK (on_favorite_toggled), self);
-
   GtkWidget *info_btn = g_object_get_data (G_OBJECT (list_item), "info-btn");
   g_object_set_data_full (G_OBJECT (info_btn), "channel",
                           g_object_ref (channel), g_object_unref);
-  g_signal_handlers_disconnect_by_func (info_btn, on_channel_info_clicked, self);
-  g_signal_connect (info_btn, "clicked", G_CALLBACK (on_channel_info_clicked), self);
 
-  /* Load artwork asynchronously */
-  const char *img_url = satwave_channel_get_image_url (channel);
-  if (img_url && *img_url) {
-    SoupMessage *img_msg = soup_message_new (SOUP_METHOD_GET, img_url);
-    if (img_msg) {
-      /* Store a weak ref to the image widget so we can update it when download completes */
-      g_object_ref (image);
-      soup_session_send_and_read_async (
-        satwave_auth_get_session (self->auth), img_msg,
-        G_PRIORITY_LOW, NULL,
-        (GAsyncReadyCallback) on_image_loaded, image);
-      g_object_unref (img_msg);
-    }
-  }
+  /* Cancel any in-flight artwork fetch from this cell's previous binding so
+   * a slow response can't overwrite the recycled cell with the wrong art */
+  GCancellable *old_cancel = g_object_get_data (G_OBJECT (list_item), "art-cancellable");
+  if (old_cancel)
+    g_cancellable_cancel (old_cancel);
+  GCancellable *art_cancel = g_cancellable_new ();
+  g_object_set_data_full (G_OBJECT (list_item), "art-cancellable",
+                          art_cancel, g_object_unref);
+
+  load_artwork (self, satwave_channel_get_image_url (channel), image, 120, art_cancel);
 }
 
 static void
-on_np_image_loaded (GObject      *source,
-                    GAsyncResult *result,
-                    gpointer      user_data)
+channel_grid_unbind (GtkListItemFactory *factory,
+                     GtkListItem        *list_item,
+                     gpointer            user_data)
 {
-  GtkWidget *image = GTK_WIDGET (user_data);
-  SoupSession *session = SOUP_SESSION (source);
-  g_autoptr (GError) error = NULL;
+  (void)factory; (void)user_data;
 
-  g_autoptr (GBytes) bytes = soup_session_send_and_read_finish (session, result, &error);
-  if (!error && bytes) {
-    g_autoptr (GdkTexture) texture = gdk_texture_new_from_bytes (bytes, NULL);
-    if (texture && GTK_IS_IMAGE (image)) {
-      gtk_image_set_from_paintable (GTK_IMAGE (image), GDK_PAINTABLE (texture));
-      gtk_image_set_pixel_size (GTK_IMAGE (image), 48);
-    }
-  }
-
-  g_object_unref (image);
+  GCancellable *art_cancel = g_object_get_data (G_OBJECT (list_item), "art-cancellable");
+  if (art_cancel)
+    g_cancellable_cancel (art_cancel);
 }
 
 /* ── Now playing bar ── */
@@ -647,18 +683,19 @@ update_now_playing (SatwaveWindow *self)
     g_autofree char *freq_text = g_strdup_printf ("CH %03d", ch_num);
     gtk_label_set_text (GTK_LABEL (self->lcd_freq_label), freq_text);
 
-    /* Load channel artwork into now-playing bar */
+    /* Load channel artwork into now-playing bar — only when it actually
+     * changed; this function runs on every player state/metadata signal.
+     * The cancellable prevents a slow fetch from a previous channel
+     * landing late and overwriting the current art. */
     const char *img_url = satwave_channel_get_image_url (self->current_channel);
-    if (img_url && *img_url) {
-      SoupMessage *msg = soup_message_new (SOUP_METHOD_GET, img_url);
-      if (msg) {
-        g_object_ref (self->np_image);
-        soup_session_send_and_read_async (
-          satwave_auth_get_session (self->auth), msg,
-          G_PRIORITY_DEFAULT, NULL,
-          (GAsyncReadyCallback) on_np_image_loaded, self->np_image);
-        g_object_unref (msg);
-      }
+    if (g_strcmp0 (img_url, self->np_art_url) != 0) {
+      g_free (self->np_art_url);
+      self->np_art_url = g_strdup (img_url);
+
+      g_cancellable_cancel (self->np_art_cancellable);
+      g_clear_object (&self->np_art_cancellable);
+      self->np_art_cancellable = g_cancellable_new ();
+      load_artwork (self, img_url, self->np_image, 48, self->np_art_cancellable);
     }
   }
 
@@ -800,8 +837,17 @@ start_now_playing_poll (SatwaveWindow *self)
                                               on_now_playing_fetched, self);
   }
 
-  /* Poll every 15 seconds */
+  /* Poll every 10 seconds */
   self->now_playing_poll_id = g_timeout_add_seconds (10, poll_now_playing, self);
+}
+
+static void
+stop_now_playing_poll (SatwaveWindow *self)
+{
+  if (self->now_playing_poll_id > 0) {
+    g_source_remove (self->now_playing_poll_id);
+    self->now_playing_poll_id = 0;
+  }
 }
 
 static void
@@ -815,7 +861,18 @@ static void
 on_player_state_changed (SatwavePlayer *player,
                          gpointer       user_data)
 {
-  update_now_playing (SATWAVE_WINDOW (user_data));
+  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
+
+  /* Don't keep waking up for metadata while paused/stopped — the app can
+   * now live in the tray for days */
+  gboolean playing = satwave_player_is_playing (self->player);
+  if (!playing)
+    stop_now_playing_poll (self);
+  else if (self->now_playing_poll_id == 0 && self->current_channel)
+    start_now_playing_poll (self);
+
+  update_now_playing (self);
+  (void)player;
 }
 
 static void
@@ -823,12 +880,11 @@ on_player_buffering (SatwavePlayer *player,
                      int            percent,
                      gpointer       user_data)
 {
-  SatwaveWindow *self = SATWAVE_WINDOW (user_data);
-
-  if (percent < 100) {
-    g_autofree char *msg = g_strdup_printf ("Buffering... %d%%", percent);
-    gtk_label_set_text (GTK_LABEL (self->np_title_label), msg);
-  }
+  /* np_title_label is hidden and feeds MPRIS metadata — writing buffering
+   * text here put "Buffering... 99%" into desktop media controls whenever
+   * a live stream hovered below 100% */
+  (void)player; (void)user_data;
+  g_debug ("Buffering... %d%%", percent);
 }
 
 static void
@@ -868,7 +924,7 @@ on_player_eos (SatwavePlayer *player,
     satwave_api_client_peek_async (
       self->api, self->current_channel,
       self->sequence_token, self->source_context_id,
-      NULL, (GAsyncReadyCallback) on_stream_url_ready, self);
+      NULL, (GAsyncReadyCallback) on_peek_ready, self);
   }
 }
 
@@ -928,8 +984,9 @@ on_volume_changed (GtkScaleButton *button,
                    gpointer        user_data)
 {
   SatwaveWindow *self = SATWAVE_WINDOW (user_data);
+  /* Persisted in save_window_state — writing dconf on every slider tick
+   * during a drag is wasteful */
   satwave_player_set_volume (self->player, value);
-  g_settings_set_double (self->settings, "volume", value);
 }
 
 /* ── Search ── */
@@ -1030,16 +1087,16 @@ on_channels_loaded (GObject      *source,
   gsize n_favs;
   const char **fav_ids = g_variant_get_strv (favs, &n_favs);
 
+  g_autoptr (GHashTable) fav_set = g_hash_table_new (g_str_hash, g_str_equal);
+  for (gsize j = 0; j < n_favs; j++)
+    g_hash_table_add (fav_set, (gpointer) fav_ids[j]);
+
   GListModel *model = satwave_channel_store_get_model (self->store);
   guint n_channels = g_list_model_get_n_items (model);
   for (guint i = 0; i < n_channels; i++) {
     g_autoptr (SatwaveChannel) ch = g_list_model_get_item (model, i);
-    for (gsize j = 0; j < n_favs; j++) {
-      if (g_strcmp0 (satwave_channel_get_id (ch), fav_ids[j]) == 0) {
-        satwave_channel_set_is_favorite (ch, TRUE);
-        break;
-      }
-    }
+    if (g_hash_table_contains (fav_set, satwave_channel_get_id (ch)))
+      satwave_channel_set_is_favorite (ch, TRUE);
   }
   g_free (fav_ids);
 
@@ -1245,6 +1302,8 @@ save_window_state (SatwaveWindow *self)
   g_settings_set_int (self->settings, "window-height", height);
   g_settings_set_boolean (self->settings, "window-maximized",
                           gtk_window_is_maximized (GTK_WINDOW (self)));
+  g_settings_set_double (self->settings, "volume",
+                         satwave_player_get_volume (self->player));
 }
 
 static gboolean
@@ -1299,6 +1358,11 @@ satwave_window_dispose (GObject *object)
   g_clear_pointer (&self->source_context_id, g_free);
   g_clear_pointer (&self->stream_queue, g_strfreev);
 
+  g_cancellable_cancel (self->np_art_cancellable);
+  g_clear_object (&self->np_art_cancellable);
+  g_clear_pointer (&self->np_art_url, g_free);
+  g_clear_pointer (&self->art_cache, g_hash_table_unref);
+
   G_OBJECT_CLASS (satwave_window_parent_class)->dispose (object);
 }
 
@@ -1314,6 +1378,8 @@ satwave_window_init (SatwaveWindow *self)
 {
   /* Core objects */
   self->settings = g_settings_new (APP_ID);
+  self->art_cache = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                           g_free, g_object_unref);
   self->auth = satwave_auth_new ();
   self->api = satwave_api_client_new (self->auth);
   self->player = satwave_player_new ();
@@ -1465,6 +1531,7 @@ satwave_window_init (SatwaveWindow *self)
   GtkListItemFactory *factory = gtk_signal_list_item_factory_new ();
   g_signal_connect (factory, "setup", G_CALLBACK (channel_grid_setup), self);
   g_signal_connect (factory, "bind", G_CALLBACK (channel_grid_bind), self);
+  g_signal_connect (factory, "unbind", G_CALLBACK (channel_grid_unbind), self);
 
   GListModel *filtered = satwave_channel_store_get_filtered (self->store);
   GtkNoSelection *selection = gtk_no_selection_new (g_object_ref (filtered));
@@ -1496,6 +1563,22 @@ satwave_window_init (SatwaveWindow *self)
   /* Try auto-login */
   gtk_stack_set_visible_child (GTK_STACK (self->main_stack), self->loading_status_page);
   satwave_auth_restore_async (self->auth, NULL, on_restore_done, self);
+}
+
+void
+satwave_window_play_channel_by_id (SatwaveWindow *self,
+                                   const char    *channel_id)
+{
+  GListModel *model = satwave_channel_store_get_model (self->store);
+  guint n = g_list_model_get_n_items (model);
+  for (guint i = 0; i < n; i++) {
+    g_autoptr (SatwaveChannel) ch = g_list_model_get_item (model, i);
+    if (g_strcmp0 (satwave_channel_get_id (ch), channel_id) == 0) {
+      play_channel (self, ch);
+      return;
+    }
+  }
+  g_warning ("play-channel: no channel with id %s", channel_id);
 }
 
 SatwaveWindow *

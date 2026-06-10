@@ -13,6 +13,7 @@ struct _SatwaveChannelStore {
 
   char           *category;
   char           *search_text;
+  char           *search_folded;  /* lowercased once per query, not per item */
   gboolean        favorites_only;
 
   GtkStringList  *categories;
@@ -43,7 +44,7 @@ search_filter_func (gpointer item,
   if (!self->search_text || self->search_text[0] == '\0')
     return TRUE;
 
-  g_autofree char *search_lower = g_utf8_strdown (self->search_text, -1);
+  const char *search_lower = self->search_folded;
 
   /* Match against channel name */
   const char *name = satwave_channel_get_name (channel);
@@ -104,6 +105,7 @@ satwave_channel_store_dispose (GObject *object)
   g_clear_object (&self->categories);
   g_clear_pointer (&self->category, g_free);
   g_clear_pointer (&self->search_text, g_free);
+  g_clear_pointer (&self->search_folded, g_free);
 
   G_OBJECT_CLASS (satwave_channel_store_parent_class)->dispose (object);
 }
@@ -155,7 +157,6 @@ void
 satwave_channel_store_set_channels (SatwaveChannelStore *self,
                                     GListStore          *channels)
 {
-  g_list_store_remove_all (self->channels);
   gtk_string_list_splice (self->categories, 0,
                           g_list_model_get_n_items (G_LIST_MODEL (self->categories)),
                           NULL);
@@ -164,9 +165,11 @@ satwave_channel_store_set_channels (SatwaveChannelStore *self,
   GHashTable *seen_cats = g_hash_table_new (g_str_hash, g_str_equal);
 
   guint n = g_list_model_get_n_items (G_LIST_MODEL (channels));
+  g_autoptr (GPtrArray) items = g_ptr_array_new_full (n, g_object_unref);
+
   for (guint i = 0; i < n; i++) {
-    g_autoptr (SatwaveChannel) ch = g_list_model_get_item (G_LIST_MODEL (channels), i);
-    g_list_store_append (self->channels, ch);
+    SatwaveChannel *ch = g_list_model_get_item (G_LIST_MODEL (channels), i);
+    g_ptr_array_add (items, ch);
 
     const char *cat = satwave_channel_get_category (ch);
     if (cat && !g_hash_table_contains (seen_cats, cat)) {
@@ -174,6 +177,12 @@ satwave_channel_store_set_channels (SatwaveChannelStore *self,
       gtk_string_list_append (self->categories, cat);
     }
   }
+
+  /* Single splice = one items-changed emission through the filter model
+   * and grid view, instead of one per channel */
+  g_list_store_splice (self->channels, 0,
+                       g_list_model_get_n_items (G_LIST_MODEL (self->channels)),
+                       items->pdata, items->len);
 
   g_hash_table_unref (seen_cats);
   g_debug ("Channel store: %u channels, %u categories",
@@ -209,6 +218,8 @@ satwave_channel_store_set_search_filter (SatwaveChannelStore *self,
 {
   g_free (self->search_text);
   self->search_text = g_strdup (search);
+  g_free (self->search_folded);
+  self->search_folded = search ? g_utf8_strdown (search, -1) : NULL;
 
   gtk_filter_changed (GTK_FILTER (self->search_filter),
                       GTK_FILTER_CHANGE_DIFFERENT);

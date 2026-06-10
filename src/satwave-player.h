@@ -21,6 +21,7 @@ void           satwave_player_set_volume (SatwavePlayer *self,
                                           double         volume);
 double         satwave_player_get_volume (SatwavePlayer *self);
 
+void           satwave_player_clear_metadata (SatwavePlayer *self);
 const char    *satwave_player_get_title  (SatwavePlayer *self);
 const char    *satwave_player_get_artist (SatwavePlayer *self);
 

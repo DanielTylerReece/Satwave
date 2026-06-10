@@ -38,6 +38,7 @@ build_image_url (const char *relative_path,
 struct _SatwaveApiClient {
   GObject      parent_instance;
   SatwaveAuth *auth;
+  GHashTable  *desc_cache;  /* slug → long description (static web content) */
 };
 
 G_DEFINE_TYPE (SatwaveApiClient, satwave_api_client, G_TYPE_OBJECT)
@@ -47,6 +48,7 @@ satwave_api_client_dispose (GObject *object)
 {
   SatwaveApiClient *self = SATWAVE_API_CLIENT (object);
   g_clear_object (&self->auth);
+  g_clear_pointer (&self->desc_cache, g_hash_table_unref);
   G_OBJECT_CLASS (satwave_api_client_parent_class)->dispose (object);
 }
 
@@ -60,7 +62,7 @@ satwave_api_client_class_init (SatwaveApiClientClass *klass)
 static void
 satwave_api_client_init (SatwaveApiClient *self)
 {
-  (void)self;
+  self->desc_cache = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 }
 
 SatwaveApiClient *
@@ -167,7 +169,6 @@ on_channels_response (GObject      *source,
    * Edge Gateway response format:
    * { "container": { "sets": [ { "items": [...] } ] } }
    */
-  GListStore *store = g_list_store_new (SATWAVE_TYPE_CHANNEL);
   JsonArray *items = NULL;
 
   if (json_object_has_member (root, "container")) {
@@ -191,6 +192,7 @@ on_channels_response (GObject      *source,
     return;
   }
 
+  GListStore *store = g_list_store_new (SATWAVE_TYPE_CHANNEL);
   guint n_items = json_array_get_length (items);
   for (guint i = 0; i < n_items; i++) {
     JsonObject *item = json_array_get_object_element (items, i);
@@ -368,7 +370,13 @@ on_stream_url_response (GObject      *source,
     return;
   }
 
-  JsonObject *root = json_node_get_object (json_parser_get_root (parser));
+  JsonNode *root_node = json_parser_get_root (parser);
+  if (!JSON_NODE_HOLDS_OBJECT (root_node)) {
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "tuneSource response is not a JSON object");
+    return;
+  }
+  JsonObject *root = json_node_get_object (root_node);
 
   /* Response: { id, type, streams: [{ urls: [{ url, isPrimary, name }] }] } */
   if (!json_object_has_member (root, "streams")) {
@@ -409,6 +417,24 @@ on_stream_url_response (GObject      *source,
 
     if (best_url)
       g_ptr_array_add (url_array, g_strdup (best_url));
+
+    /* Log track names for debugging */
+    if (json_object_has_member (stream, "metadata")) {
+      JsonObject *meta = json_object_get_object_member (stream, "metadata");
+      if (json_object_has_member (meta, "xtra")) {
+        JsonObject *xtra = json_object_get_object_member (meta, "xtra");
+        const char *ch_name = json_object_get_string_member_with_default (xtra, "channelName", "");
+        if (json_object_has_member (xtra, "items")) {
+          JsonArray *xtra_items = json_object_get_array_member (xtra, "items");
+          if (json_array_get_length (xtra_items) > 0) {
+            JsonObject *item = json_array_get_object_element (xtra_items, 0);
+            const char *title = json_object_get_string_member_with_default (item, "name", "?");
+            const char *artist = json_object_get_string_member_with_default (item, "artistName", "?");
+            g_debug ("  track[%u]: \"%s\" by %s [%s]", s, title, artist, ch_name);
+          }
+        }
+      }
+    }
   }
 
   if (url_array->len == 0) {
@@ -416,27 +442,6 @@ on_stream_url_response (GObject      *source,
     g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
                             "No stream URL found in response");
     return;
-  }
-
-  /* Log track names for debugging */
-  for (guint s = 0; s < n_streams; s++) {
-    JsonObject *stream = json_array_get_object_element (streams, s);
-    if (json_object_has_member (stream, "metadata")) {
-      JsonObject *meta = json_object_get_object_member (stream, "metadata");
-      if (json_object_has_member (meta, "xtra")) {
-        JsonObject *xtra = json_object_get_object_member (meta, "xtra");
-        const char *ch_name = json_object_get_string_member_with_default (xtra, "channelName", "");
-        if (json_object_has_member (xtra, "items")) {
-          JsonArray *items = json_object_get_array_member (xtra, "items");
-          if (json_array_get_length (items) > 0) {
-            JsonObject *item = json_array_get_object_element (items, 0);
-            const char *title = json_object_get_string_member_with_default (item, "name", "?");
-            const char *artist = json_object_get_string_member_with_default (item, "artistName", "?");
-            g_message ("  track[%u]: \"%s\" by %s [%s]", s, title, artist, ch_name);
-          }
-        }
-      }
-    }
   }
 
   SatwaveStreamInfo *info = g_new0 (SatwaveStreamInfo, 1);
@@ -496,7 +501,8 @@ satwave_api_client_get_stream_url_async (SatwaveApiClient    *self,
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
-  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autoptr (JsonNode) gen_root = json_builder_get_root (b);
+  json_generator_set_root (gen, gen_root);
   g_autofree char *body = json_generator_to_data (gen, NULL);
 
   SoupMessage *msg = make_auth_post (self->auth, "playback/play/v1/tuneSource", body);
@@ -545,7 +551,8 @@ satwave_api_client_peek_async (SatwaveApiClient    *self,
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
-  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autoptr (JsonNode) gen_root = json_builder_get_root (b);
+  json_generator_set_root (gen, gen_root);
   g_autofree char *body = json_generator_to_data (gen, NULL);
 
   SoupMessage *msg = make_auth_post (self->auth, "playback/play/v1/peek", body);
@@ -613,7 +620,13 @@ on_now_playing_response (GObject      *source,
     return;
   }
 
-  JsonObject *root = json_node_get_object (json_parser_get_root (parser));
+  JsonNode *root_node = json_parser_get_root (parser);
+  if (!JSON_NODE_HOLDS_OBJECT (root_node)) {
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "liveUpdate response is not a JSON object");
+    return;
+  }
+  JsonObject *root = json_node_get_object (root_node);
 
   SatwaveNowPlaying *np = g_new0 (SatwaveNowPlaying, 1);
 
@@ -668,7 +681,8 @@ satwave_api_client_get_now_playing_async (SatwaveApiClient    *self,
   json_builder_end_object (b);
 
   g_autoptr (JsonGenerator) gen = json_generator_new ();
-  json_generator_set_root (gen, json_builder_get_root (b));
+  g_autoptr (JsonNode) gen_root = json_builder_get_root (b);
+  json_generator_set_root (gen, gen_root);
   g_autofree char *body = json_generator_to_data (gen, NULL);
 
   SoupMessage *msg = make_auth_post (self->auth, "playback/play/v1/liveUpdate", body);
@@ -738,33 +752,43 @@ on_channel_desc_response (GObject      *source,
 
   gsize size;
   const char *html = g_bytes_get_data (bytes, &size);
+  g_autofree char *desc = NULL;
 
-  /* Extract og:description from the HTML */
-  const char *og_start = strstr (html, "og:description");
+  /* Extract og:description from the HTML. The buffer is NOT NUL-terminated,
+   * so every search must be length-bounded. */
+  const char *og_start = g_strstr_len (html, size, "og:description");
   if (!og_start)
-    og_start = strstr (html, "name=\"description\"");
+    og_start = g_strstr_len (html, size, "name=\"description\"");
 
   if (og_start) {
-    const char *content = strstr (og_start, "content=\"");
+    const char *content = g_strstr_len (og_start, size - (og_start - html), "content=\"");
     if (content) {
       content += 9; /* skip content=" */
-      const char *end = strchr (content, '"');
-      if (end && end > content) {
-        g_autofree char *desc = g_strndup (content, end - content);
-        /* Unescape HTML entities */
-        g_autofree char *unescaped = g_strdup (desc);
-        /* Basic entity replacement */
-        GString *result_str = g_string_new (unescaped);
-        g_string_replace (result_str, "&amp;", "&", 0);
-        g_string_replace (result_str, "&#x27;", "'", 0);
-        g_string_replace (result_str, "&quot;", "\"", 0);
-        g_string_replace (result_str, "&#39;", "'", 0);
-        g_string_replace (result_str, "&lt;", "<", 0);
-        g_string_replace (result_str, "&gt;", ">", 0);
-        g_task_return_pointer (task, g_string_free (result_str, FALSE), g_free);
-        return;
-      }
+      const char *end = memchr (content, '"', size - (content - html));
+      if (end && end > content)
+        desc = g_strndup (content, end - content);
     }
+  }
+
+  if (desc) {
+    /* Basic HTML entity replacement */
+    GString *result_str = g_string_new (desc);
+    g_string_replace (result_str, "&amp;", "&", 0);
+    g_string_replace (result_str, "&#x27;", "'", 0);
+    g_string_replace (result_str, "&quot;", "\"", 0);
+    g_string_replace (result_str, "&#39;", "'", 0);
+    g_string_replace (result_str, "&lt;", "<", 0);
+    g_string_replace (result_str, "&gt;", ">", 0);
+
+    /* Cache by slug — the page content is static */
+    SatwaveApiClient *self = g_task_get_source_object (task);
+    const char *slug = g_object_get_data (G_OBJECT (task), "slug");
+    if (self && slug)
+      g_hash_table_replace (self->desc_cache,
+                            g_strdup (slug), g_strdup (result_str->str));
+
+    g_task_return_pointer (task, g_string_free (result_str, FALSE), g_free);
+    return;
   }
 
   g_task_return_pointer (task, g_strdup (""), g_free);
@@ -780,6 +804,16 @@ satwave_api_client_get_channel_desc_async (SatwaveApiClient    *self,
   g_autoptr (GTask) task = g_task_new (self, cancellable, callback, user_data);
 
   g_autofree char *slug = slugify (channel_name);
+
+  /* Serve repeat opens from the cache — the page is several hundred KB */
+  const char *cached = g_hash_table_lookup (self->desc_cache, slug);
+  if (cached) {
+    g_task_return_pointer (task, g_strdup (cached), g_free);
+    return;
+  }
+
+  g_object_set_data_full (G_OBJECT (task), "slug", g_strdup (slug), g_free);
+
   g_autofree char *url = g_strdup_printf ("https://www.siriusxm.com/channels/%s", slug);
 
   SoupMessage *msg = soup_message_new (SOUP_METHOD_GET, url);

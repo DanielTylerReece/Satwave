@@ -11,4 +11,7 @@ G_DECLARE_FINAL_TYPE (SatwaveWindow, satwave_window, SATWAVE, WINDOW, AdwApplica
 
 SatwaveWindow *satwave_window_new (SatwaveApplication *app);
 
+void satwave_window_play_channel_by_id (SatwaveWindow *self,
+                                        const char    *channel_id);
+
 G_END_DECLS

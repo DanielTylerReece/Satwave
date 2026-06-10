@@ -14,6 +14,10 @@
  *
  * The Edge Gateway API returns stream URLs that may include auth in the URL
  * itself or require Bearer token. This proxy handles both cases.
+ *
+ * All upstream fetches are asynchronous: the server message is paused while
+ * the fetch is in flight so the GTK main loop never blocks on the CDN, and
+ * concurrent playlist/segment/key requests overlap instead of serializing.
  */
 
 /* Known AES-128 decryption key: base64 "0Nsco7MAgxowGvkUT8aYag==" decoded */
@@ -35,6 +39,44 @@ struct _SatwaveHlsProxy {
 
 G_DEFINE_TYPE (SatwaveHlsProxy, satwave_hls_proxy, G_TYPE_OBJECT)
 
+/* Per-request state for an async upstream fetch while the server message
+ * is paused. The cancellable fires if the client disconnects first. */
+typedef struct {
+  SatwaveHlsProxy   *self;        /* strong ref */
+  SoupServerMessage *msg;         /* strong ref */
+  SoupMessage       *upstream;    /* strong ref, for status code */
+  GCancellable      *cancellable;
+  gulong             finished_id;
+  char              *upstream_url;
+  gboolean           is_key;      /* /key request: parse JSON, serve raw key */
+  gboolean           check_suffix; /* /proxy request: .m3u8 suffix implies playlist */
+} ProxyRequest;
+
+static void
+proxy_request_free (ProxyRequest *req)
+{
+  if (req->finished_id > 0)
+    g_signal_handler_disconnect (req->msg, req->finished_id);
+  g_clear_object (&req->upstream);
+  g_clear_object (&req->cancellable);
+  g_clear_object (&req->msg);
+  g_clear_object (&req->self);
+  g_free (req->upstream_url);
+  g_free (req);
+}
+
+static void
+on_server_message_finished (SoupServerMessage *msg,
+                            gpointer           user_data)
+{
+  ProxyRequest *req = user_data;
+  (void)msg;
+
+  /* Client went away — abort the upstream fetch; the fetch callback
+   * still runs (with G_IO_ERROR_CANCELLED) and frees the request. */
+  g_cancellable_cancel (req->cancellable);
+}
+
 /* Extract base URL (everything up to last /) from a full URL */
 static char *
 url_base (const char *url)
@@ -43,45 +85,6 @@ url_base (const char *url)
   if (!last_slash || last_slash == url)
     return g_strdup (url);
   return g_strndup (url, last_slash - url + 1);
-}
-
-/* Fetch content from upstream, injecting auth if needed */
-static GBytes *
-fetch_upstream (SatwaveHlsProxy *self,
-                const char      *url)
-{
-  SoupMessage *msg = soup_message_new (SOUP_METHOD_GET, url);
-  if (!msg) {
-    g_warning ("Invalid upstream URL: %s", url);
-    return NULL;
-  }
-
-  /* Add Bearer auth if URL is on SiriusXM domain */
-  const char *token = satwave_auth_get_access_token (self->auth);
-  if (token && (strstr (url, "siriusxm") || strstr (url, "edge-gateway"))) {
-    SoupMessageHeaders *headers = soup_message_get_request_headers (msg);
-    g_autofree char *bearer = g_strdup_printf ("Bearer %s", token);
-    soup_message_headers_replace (headers, "Authorization", bearer);
-  }
-
-  GError *error = NULL;
-  GBytes *bytes = soup_session_send_and_read (self->fetch_session, msg, NULL, &error);
-  guint status = soup_message_get_status (msg);
-  g_object_unref (msg);
-
-  if (error) {
-    g_warning ("Upstream fetch failed for %s: %s", url, error->message);
-    g_error_free (error);
-    return NULL;
-  }
-
-  if (status >= 400) {
-    g_warning ("Upstream returned HTTP %u for %s", status, url);
-    g_bytes_unref (bytes);
-    return NULL;
-  }
-
-  return bytes;
 }
 
 /* Rewrite HLS playlist: replace segment/key URLs to go through our proxy.
@@ -155,6 +158,204 @@ rewrite_playlist (SatwaveHlsProxy *self,
   return g_string_free (result, FALSE);
 }
 
+/* ── Response helpers (zero-copy) ── */
+
+static void
+respond_bytes (SoupServerMessage *msg,
+               const char        *content_type,
+               GBytes            *bytes)
+{
+  SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
+  soup_message_headers_replace (resp_headers, "Content-Type", content_type);
+  soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
+
+  SoupMessageBody *body = soup_server_message_get_response_body (msg);
+  soup_message_body_append_bytes (body, bytes);
+  soup_message_body_complete (body);
+
+  soup_server_message_set_status (msg, 200, NULL);
+}
+
+/* Takes ownership of the string */
+static void
+respond_text_take (SoupServerMessage *msg,
+                   const char        *content_type,
+                   char              *text)
+{
+  GBytes *bytes = g_bytes_new_take (text, strlen (text));
+  respond_bytes (msg, content_type, bytes);
+  g_bytes_unref (bytes);
+}
+
+static void
+respond_default_key (SoupServerMessage *msg)
+{
+  SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
+  soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
+  soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
+  soup_server_message_set_response (msg, "application/octet-stream",
+                                    SOUP_MEMORY_STATIC,
+                                    SXM_AES_KEY_RAW,
+                                    sizeof (SXM_AES_KEY_RAW));
+  soup_server_message_set_status (msg, 200, NULL);
+}
+
+/* ── Async upstream fetch ── */
+
+static void on_upstream_fetched (GObject *source, GAsyncResult *result, gpointer user_data);
+
+/* Build the upstream request, pause the server message and fetch async.
+ * Takes ownership of upstream (the SoupMessage). */
+static void
+fetch_upstream_async (SatwaveHlsProxy   *self,
+                      SoupServerMessage *msg,
+                      SoupMessage       *upstream,
+                      const char        *url,
+                      gboolean           is_key,
+                      gboolean           check_suffix)
+{
+  ProxyRequest *req = g_new0 (ProxyRequest, 1);
+  req->self = g_object_ref (self);
+  req->msg = g_object_ref (msg);
+  req->upstream = upstream; /* takes ownership */
+  req->cancellable = g_cancellable_new ();
+  req->upstream_url = g_strdup (url);
+  req->is_key = is_key;
+  req->check_suffix = check_suffix;
+  req->finished_id = g_signal_connect (msg, "finished",
+                                       G_CALLBACK (on_server_message_finished), req);
+
+  soup_server_message_pause (msg);
+
+  soup_session_send_and_read_async (self->fetch_session, upstream,
+                                    G_PRIORITY_DEFAULT, req->cancellable,
+                                    on_upstream_fetched, req);
+}
+
+/* Build a plain upstream GET with Bearer auth on SiriusXM domains */
+static SoupMessage *
+make_upstream_message (SatwaveHlsProxy *self,
+                       const char      *url)
+{
+  SoupMessage *msg = soup_message_new (SOUP_METHOD_GET, url);
+  if (!msg) {
+    g_warning ("Invalid upstream URL: %s", url);
+    return NULL;
+  }
+
+  const char *token = satwave_auth_get_access_token (self->auth);
+  if (token && (strstr (url, "siriusxm") || strstr (url, "edge-gateway"))) {
+    SoupMessageHeaders *headers = soup_message_get_request_headers (msg);
+    g_autofree char *bearer = g_strdup_printf ("Bearer %s", token);
+    soup_message_headers_replace (headers, "Authorization", bearer);
+  }
+
+  return msg;
+}
+
+static void
+finish_key_request (ProxyRequest *req,
+                    GBytes       *bytes)
+{
+  /* Parse JSON response: {"keyId":"...","key":"base64_key"} */
+  gsize size;
+  const char *data = g_bytes_get_data (bytes, &size);
+
+  g_autoptr (JsonParser) parser = json_parser_new ();
+  if (json_parser_load_from_data (parser, data, size, NULL)) {
+    JsonNode *root_node = json_parser_get_root (parser);
+    if (JSON_NODE_HOLDS_OBJECT (root_node)) {
+      JsonObject *obj = json_node_get_object (root_node);
+      const char *b64_key = json_object_get_string_member_with_default (obj, "key", NULL);
+
+      if (b64_key) {
+        gsize key_len = 0;
+        g_autofree guchar *raw_key = g_base64_decode (b64_key, &key_len);
+
+        if (raw_key && key_len == 16) {
+          g_autoptr (GBytes) key_bytes = g_bytes_new (raw_key, key_len);
+          respond_bytes (req->msg, "application/octet-stream", key_bytes);
+          return;
+        }
+      }
+    }
+  }
+
+  /* Last resort fallback */
+  g_warning ("Could not parse key response for %s, using default", req->upstream_url);
+  respond_default_key (req->msg);
+}
+
+static void
+finish_content_request (ProxyRequest *req,
+                        GBytes       *bytes)
+{
+  gsize size;
+  const char *data = g_bytes_get_data (bytes, &size);
+
+  gboolean is_playlist =
+    (req->check_suffix && g_str_has_suffix (req->upstream_url, ".m3u8")) ||
+    (size > 0 && data[0] == '#');
+
+  if (is_playlist) {
+    /* Compute base URL from THIS playlist's URL for correct relative resolution */
+    g_autofree char *this_base = url_base (req->upstream_url);
+    respond_text_take (req->msg, "application/vnd.apple.mpegurl",
+                       rewrite_playlist (req->self, data, this_base));
+  } else {
+    const char *ct = "application/octet-stream";
+    if (g_str_has_suffix (req->upstream_url, ".aac"))
+      ct = "audio/aac";
+    else if (g_str_has_suffix (req->upstream_url, ".ts"))
+      ct = "video/mp2t";
+    respond_bytes (req->msg, ct, bytes);
+  }
+}
+
+static void
+on_upstream_fetched (GObject      *source,
+                     GAsyncResult *result,
+                     gpointer      user_data)
+{
+  ProxyRequest *req = user_data;
+  g_autoptr (GError) error = NULL;
+
+  g_autoptr (GBytes) bytes =
+    soup_session_send_and_read_finish (SOUP_SESSION (source), result, &error);
+
+  /* Client disconnected while we were fetching — nothing to respond to */
+  if (g_cancellable_is_cancelled (req->cancellable)) {
+    proxy_request_free (req);
+    return;
+  }
+
+  guint status = req->upstream ? soup_message_get_status (req->upstream) : 0;
+
+  if (error || !bytes) {
+    g_warning ("Upstream fetch failed for %s: %s",
+               req->upstream_url, error ? error->message : "no data");
+    if (req->is_key)
+      respond_default_key (req->msg);
+    else
+      soup_server_message_set_status (req->msg, 502, "Upstream fetch failed");
+  } else if (status >= 400) {
+    g_warning ("Upstream returned HTTP %u for %s", status, req->upstream_url);
+    if (req->is_key)
+      respond_default_key (req->msg);
+    else
+      soup_server_message_set_status (req->msg, 502, "Upstream fetch failed");
+  } else if (req->is_key) {
+    finish_key_request (req, bytes);
+  } else {
+    finish_content_request (req, bytes);
+  }
+
+  soup_server_message_unpause (req->msg);
+  proxy_request_free (req);
+}
+
+/* ── Handlers ── */
+
 /* Handler: /key/{keyId} — fetch and serve AES decryption key from SXM API */
 static void
 handle_key_request (SoupServer        *server,
@@ -174,14 +375,7 @@ handle_key_request (SoupServer        *server,
   /* Check if it's the well-known default key */
   if (g_strcmp0 (key_id, "1") == 0 ||
       g_strcmp0 (key_id, "00000000-0000-0000-0000-000000000000") == 0) {
-    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-    soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
-    soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-    soup_server_message_set_response (msg, "application/octet-stream",
-                                      SOUP_MEMORY_COPY,
-                                      SXM_AES_KEY_RAW,
-                                      sizeof (SXM_AES_KEY_RAW));
-    soup_server_message_set_status (msg, 200, NULL);
+    respond_default_key (msg);
     return;
   }
 
@@ -201,62 +395,7 @@ handle_key_request (SoupServer        *server,
     soup_message_headers_replace (req_headers, "Authorization", bearer);
   }
 
-  GError *error = NULL;
-  GBytes *bytes = soup_session_send_and_read (self->fetch_session, key_msg, NULL, &error);
-  g_object_unref (key_msg);
-
-  if (error || !bytes) {
-    g_warning ("Failed to fetch key %s: %s", key_id, error ? error->message : "no data");
-    g_clear_error (&error);
-    /* Fallback to default key */
-    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-    soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
-    soup_server_message_set_response (msg, "application/octet-stream",
-                                      SOUP_MEMORY_COPY,
-                                      SXM_AES_KEY_RAW,
-                                      sizeof (SXM_AES_KEY_RAW));
-    soup_server_message_set_status (msg, 200, NULL);
-    return;
-  }
-
-  /* Parse JSON response: {"keyId":"...","key":"base64_key"} */
-  gsize size;
-  const char *data = g_bytes_get_data (bytes, &size);
-
-  g_autoptr (JsonParser) parser = json_parser_new ();
-  if (json_parser_load_from_data (parser, data, size, NULL)) {
-    JsonObject *obj = json_node_get_object (json_parser_get_root (parser));
-    const char *b64_key = json_object_get_string_member_with_default (obj, "key", NULL);
-
-    if (b64_key) {
-      gsize key_len = 0;
-      g_autofree guchar *raw_key = g_base64_decode (b64_key, &key_len);
-
-      if (raw_key && key_len == 16) {
-        SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-        soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
-        soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-        soup_server_message_set_response (msg, "application/octet-stream",
-                                          SOUP_MEMORY_COPY,
-                                          (const char *)raw_key, key_len);
-        soup_server_message_set_status (msg, 200, NULL);
-        g_bytes_unref (bytes);
-        return;
-      }
-    }
-  }
-
-  g_bytes_unref (bytes);
-
-  /* Last resort fallback */
-  g_warning ("Could not parse key response for %s, using default", key_id);
-  SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-  soup_message_headers_replace (resp_headers, "Content-Type", "application/octet-stream");
-  soup_server_message_set_response (msg, "application/octet-stream",
-                                    SOUP_MEMORY_COPY,
-                                    SXM_AES_KEY_RAW,
-                                    sizeof (SXM_AES_KEY_RAW));
-  soup_server_message_set_status (msg, 200, NULL);
+  fetch_upstream_async (self, msg, key_msg, key_url, TRUE, FALSE);
 }
 
 /* Handler: /master — serve the top-level playlist (entry point for GStreamer) */
@@ -275,33 +414,13 @@ handle_master_request (SoupServer        *server,
     return;
   }
 
-  g_autoptr (GBytes) bytes = fetch_upstream (self, self->upstream_url);
-  if (!bytes) {
-    soup_server_message_set_status (msg, 502, "Upstream fetch failed");
+  SoupMessage *upstream = make_upstream_message (self, self->upstream_url);
+  if (!upstream) {
+    soup_server_message_set_status (msg, 502, "Invalid upstream URL");
     return;
   }
 
-  gsize size;
-  const char *data = g_bytes_get_data (bytes, &size);
-
-  /* Check if this is a playlist (text) or binary data */
-  if (size > 0 && data[0] == '#') {
-    g_autofree char *rewritten = rewrite_playlist (self, data, self->upstream_base);
-
-    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-    soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-
-    soup_server_message_set_response (msg, "application/vnd.apple.mpegurl",
-                                      SOUP_MEMORY_COPY,
-                                      rewritten, strlen (rewritten));
-  } else {
-    SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-    soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-    soup_server_message_set_response (msg, "application/octet-stream",
-                                      SOUP_MEMORY_COPY, data, size);
-  }
-
-  soup_server_message_set_status (msg, 200, NULL);
+  fetch_upstream_async (self, msg, upstream, self->upstream_url, FALSE, FALSE);
 }
 
 /* Handler: /proxy?url=<encoded_url> — generic proxy for segments and sub-playlists */
@@ -321,43 +440,19 @@ handle_proxy_request (SoupServer        *server,
     return;
   }
 
-  g_autofree char *upstream = g_uri_unescape_string (encoded_url, NULL);
-  if (!upstream) {
+  g_autofree char *upstream_url = g_uri_unescape_string (encoded_url, NULL);
+  if (!upstream_url) {
     soup_server_message_set_status (msg, 400, "Invalid url parameter");
     return;
   }
 
-  g_autoptr (GBytes) bytes = fetch_upstream (self, upstream);
-  if (!bytes) {
-    soup_server_message_set_status (msg, 502, "Upstream fetch failed");
+  SoupMessage *upstream = make_upstream_message (self, upstream_url);
+  if (!upstream) {
+    soup_server_message_set_status (msg, 502, "Invalid upstream URL");
     return;
   }
 
-  gsize size;
-  const char *data = g_bytes_get_data (bytes, &size);
-
-  SoupMessageHeaders *resp_headers = soup_server_message_get_response_headers (msg);
-  soup_message_headers_replace (resp_headers, "Access-Control-Allow-Origin", "*");
-
-  /* If it's a playlist, rewrite it; otherwise pass through */
-  if (g_str_has_suffix (upstream, ".m3u8") || (size > 0 && data[0] == '#')) {
-    /* Compute base URL from THIS playlist's URL for correct relative resolution */
-    g_autofree char *this_base = url_base (upstream);
-
-    g_autofree char *rewritten = rewrite_playlist (self, data, this_base);
-    soup_server_message_set_response (msg, "application/vnd.apple.mpegurl",
-                                      SOUP_MEMORY_COPY,
-                                      rewritten, strlen (rewritten));
-  } else {
-    const char *ct = "application/octet-stream";
-    if (g_str_has_suffix (upstream, ".aac"))
-      ct = "audio/aac";
-    else if (g_str_has_suffix (upstream, ".ts"))
-      ct = "video/mp2t";
-    soup_server_message_set_response (msg, ct, SOUP_MEMORY_COPY, data, size);
-  }
-
-  soup_server_message_set_status (msg, 200, NULL);
+  fetch_upstream_async (self, msg, upstream, upstream_url, FALSE, TRUE);
 }
 
 static void

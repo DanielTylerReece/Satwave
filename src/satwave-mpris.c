@@ -340,6 +340,14 @@ satwave_mpris_set_metadata (SatwaveMpris *self,
                             const char   *channel_name,
                             const char   *art_url)
 {
+  /* Skip the D-Bus broadcast when nothing changed — GStreamer re-emits
+   * identical tags on HLS segment boundaries */
+  if (g_strcmp0 (self->title, title) == 0 &&
+      g_strcmp0 (self->artist, artist) == 0 &&
+      g_strcmp0 (self->channel_name, channel_name) == 0 &&
+      g_strcmp0 (self->art_url, art_url) == 0)
+    return;
+
   g_free (self->title);
   g_free (self->artist);
   g_free (self->channel_name);
@@ -358,6 +366,9 @@ void
 satwave_mpris_set_playback_status (SatwaveMpris *self,
                                    gboolean      playing)
 {
+  if (self->playing == playing)
+    return;
+
   self->playing = playing;
 
   emit_properties_changed (self,

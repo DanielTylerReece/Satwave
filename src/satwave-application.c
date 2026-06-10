@@ -182,9 +182,24 @@ on_preferences_action (GSimpleAction *action,
   adw_dialog_present (ADW_DIALOG (prefs), GTK_WIDGET (window));
 }
 
+static void
+on_play_channel_action (GSimpleAction *action,
+                        GVariant      *parameter,
+                        gpointer       user_data)
+{
+  SatwaveApplication *self = SATWAVE_APPLICATION (user_data);
+  GtkWindow *window = satwave_application_get_window (self);
+  (void)action;
+
+  if (window)
+    satwave_window_play_channel_by_id (SATWAVE_WINDOW (window),
+                                       g_variant_get_string (parameter, NULL));
+}
+
 static const GActionEntry app_actions[] = {
   { "about", on_about_action },
   { "preferences", on_preferences_action },
+  { "play-channel", on_play_channel_action, "s" },
   { "quit", on_quit_action },
 };
 

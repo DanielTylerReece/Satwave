@@ -4,6 +4,8 @@ struct _SatwaveLoginDialog {
   AdwDialog    parent_instance;
 
   SatwaveAuth *auth;
+  GCancellable *login_cancellable;
+  gboolean      disposed;
 
   GtkWidget   *username_row;
   GtkWidget   *password_row;
@@ -26,8 +28,16 @@ on_login_complete (GObject      *source,
                    GAsyncResult *result,
                    gpointer      user_data)
 {
-  SatwaveLoginDialog *self = SATWAVE_LOGIN_DIALOG (user_data);
+  /* We hold a strong ref (passed as user_data) so the object is alive,
+   * but the widgets are gone once the dialog was closed mid-login —
+   * bail out before touching them. */
+  g_autoptr (SatwaveLoginDialog) self = SATWAVE_LOGIN_DIALOG (user_data);
   g_autoptr (GError) error = NULL;
+
+  if (self->disposed) {
+    satwave_auth_login_finish (SATWAVE_AUTH (source), result, &error);
+    return;
+  }
 
   gtk_widget_set_visible (self->spinner, FALSE);
   gtk_widget_set_sensitive (self->login_button, TRUE);
@@ -71,15 +81,25 @@ on_login_clicked (GtkButton *button,
   gtk_widget_set_sensitive (self->username_row, FALSE);
   gtk_widget_set_sensitive (self->password_row, FALSE);
 
+  g_cancellable_cancel (self->login_cancellable);
+  g_clear_object (&self->login_cancellable);
+  self->login_cancellable = g_cancellable_new ();
+
   satwave_auth_login_async (self->auth, username, password,
-                            NULL, on_login_complete, self);
+                            self->login_cancellable,
+                            on_login_complete, g_object_ref (self));
 }
 
 static void
 satwave_login_dialog_dispose (GObject *object)
 {
   SatwaveLoginDialog *self = SATWAVE_LOGIN_DIALOG (object);
+
+  self->disposed = TRUE;
+  g_cancellable_cancel (self->login_cancellable);
+  g_clear_object (&self->login_cancellable);
   g_clear_object (&self->auth);
+
   G_OBJECT_CLASS (satwave_login_dialog_parent_class)->dispose (object);
 }
 
