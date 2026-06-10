@@ -36,5 +36,10 @@
       <default>false</default>
       <summary>Whether window is maximized</summary>
     </key>
+    <key name="run-in-background" type="b">
+      <default>true</default>
+      <summary>Run in background</summary>
+      <description>Keep Satwave running with a system tray icon when the window is closed</description>
+    </key>
   </schema>
 </schemalist>

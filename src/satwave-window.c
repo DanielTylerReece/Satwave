@@ -1237,6 +1237,35 @@ build_now_playing_bar (SatwaveWindow *self)
 }
 
 static void
+save_window_state (SatwaveWindow *self)
+{
+  int width, height;
+  gtk_window_get_default_size (GTK_WINDOW (self), &width, &height);
+  g_settings_set_int (self->settings, "window-width", width);
+  g_settings_set_int (self->settings, "window-height", height);
+  g_settings_set_boolean (self->settings, "window-maximized",
+                          gtk_window_is_maximized (GTK_WINDOW (self)));
+}
+
+static gboolean
+on_close_request (GtkWindow *window,
+                  gpointer   user_data)
+{
+  SatwaveWindow *self = SATWAVE_WINDOW (window);
+  (void)user_data;
+
+  if (g_settings_get_boolean (self->settings, "run-in-background")) {
+    /* Hide instead of destroying; playback continues and the tray icon
+     * brings the window back. */
+    save_window_state (self);
+    gtk_widget_set_visible (GTK_WIDGET (window), FALSE);
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+static void
 satwave_window_dispose (GObject *object)
 {
   SatwaveWindow *self = SATWAVE_WINDOW (object);
@@ -1254,13 +1283,7 @@ satwave_window_dispose (GObject *object)
   satwave_player_stop (self->player);
   satwave_hls_proxy_stop (self->proxy);
 
-  /* Save window state */
-  int width, height;
-  gtk_window_get_default_size (GTK_WINDOW (self), &width, &height);
-  g_settings_set_int (self->settings, "window-width", width);
-  g_settings_set_int (self->settings, "window-height", height);
-  g_settings_set_boolean (self->settings, "window-maximized",
-                          gtk_window_is_maximized (GTK_WINDOW (self)));
+  save_window_state (self);
 
   g_clear_object (&self->auth);
   g_clear_object (&self->api);
@@ -1332,6 +1355,9 @@ satwave_window_init (SatwaveWindow *self)
   gtk_window_set_title (GTK_WINDOW (self), "Satwave");
   gtk_window_set_icon_name (GTK_WINDOW (self), APP_ID);
 
+  g_signal_connect (self, "close-request",
+                    G_CALLBACK (on_close_request), NULL);
+
   /* Toast overlay wraps everything */
   self->toast_overlay = adw_toast_overlay_new ();
 
@@ -1349,6 +1375,7 @@ satwave_window_init (SatwaveWindow *self)
 
   /* Menu button */
   GMenu *menu = g_menu_new ();
+  g_menu_append (menu, "Preferences", "app.preferences");
   g_menu_append (menu, "About Satwave", "app.about");
   g_menu_append (menu, "Quit", "app.quit");
   GtkWidget *menu_button = gtk_menu_button_new ();

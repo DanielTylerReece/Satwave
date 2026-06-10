@@ -62,6 +62,7 @@ sources = files(
   'src/satwave-login-dialog.c',
   'src/satwave-mpris.c',
   'src/satwave-call-monitor.c',
+  'src/satwave-tray.c',
 )
 
 executable('satwave',
