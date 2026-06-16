@@ -596,6 +596,56 @@ satwave_now_playing_free (SatwaveNowPlaying *np)
   g_free (np);
 }
 
+/*
+ * liveUpdate returns the channel's full recent cut history (hours of songs),
+ * ordered ascending by timestamp — items[0] is the OLDEST, items[N-1] the
+ * newest (live edge). Each cut carries an absolute "timestamp" (when it began
+ * airing) but no "currently playing" flag, so we locate the airing cut by
+ * wall-clock.
+ *
+ * The audio the user hears lags the live edge: GStreamer's HLS demuxer starts
+ * live playback roughly three target-durations (~30s) behind the playlist's
+ * live edge and holds that offset. So the cut the user is actually hearing is
+ * the latest one that began at or before (now - LIVE_EDGE_DELAY_SECONDS), not
+ * the newest cut and certainly not items[0].
+ */
+#define LIVE_EDGE_DELAY_SECONDS 30
+
+/* Return the index of the latest array element whose ISO-8601 `ts_field`
+ * is at or before `target`. Array is assumed ascending by that field.
+ * When skip_interstitial is set, station-ID interstitials are not chosen
+ * (but are tracked as a fallback). Returns -1 if nothing qualifies. */
+static gint
+select_airing_index (JsonArray  *arr,
+                     const char *ts_field,
+                     GDateTime  *target,
+                     gboolean    skip_interstitial)
+{
+  guint n = json_array_get_length (arr);
+  gint best = -1, best_any = -1;
+
+  for (guint i = 0; i < n; i++) {
+    JsonObject *o = json_array_get_object_element (arr, i);
+    const char *ts = json_object_get_string_member_with_default (o, ts_field, NULL);
+    if (!ts)
+      continue;
+
+    g_autoptr (GDateTime) t = g_date_time_new_from_iso8601 (ts, NULL);
+    if (!t)
+      continue;
+
+    if (g_date_time_compare (t, target) > 0)
+      break; /* ascending: nothing later can qualify */
+
+    best_any = (gint) i;
+    if (!(skip_interstitial &&
+          json_object_get_boolean_member_with_default (o, "isInterstitial", FALSE)))
+      best = (gint) i;
+  }
+
+  return best >= 0 ? best : best_any;
+}
+
 static void
 on_now_playing_response (GObject      *source,
                          GAsyncResult *result,
@@ -630,11 +680,19 @@ on_now_playing_response (GObject      *source,
 
   SatwaveNowPlaying *np = g_new0 (SatwaveNowPlaying, 1);
 
-  /* Extract from items[0] — the currently playing track */
+  /* Target the moment currently in the user's ears, not the live edge */
+  g_autoptr (GDateTime) now = g_date_time_new_now_utc ();
+  g_autoptr (GDateTime) target = g_date_time_add_seconds (now, -LIVE_EDGE_DELAY_SECONDS);
+
+  /* Pick the cut (song) airing at the target time */
   if (json_object_has_member (root, "items")) {
     JsonArray *items = json_object_get_array_member (root, "items");
-    if (json_array_get_length (items) > 0) {
-      JsonObject *item = json_array_get_object_element (items, 0);
+    guint n = json_array_get_length (items);
+    if (n > 0) {
+      gint idx = select_airing_index (items, "timestamp", target, TRUE);
+      if (idx < 0)
+        idx = (gint) (n - 1); /* target predates all history: best-effort live edge */
+      JsonObject *item = json_array_get_object_element (items, idx);
       np->song_title = g_strdup (
         json_object_get_string_member_with_default (item, "name", NULL));
       np->artist_name = g_strdup (
@@ -642,11 +700,15 @@ on_now_playing_response (GObject      *source,
     }
   }
 
-  /* Extract show name from episodes[0] */
+  /* Pick the show (episode) airing at the target time */
   if (json_object_has_member (root, "episodes")) {
     JsonArray *episodes = json_object_get_array_member (root, "episodes");
-    if (json_array_get_length (episodes) > 0) {
-      JsonObject *ep = json_array_get_object_element (episodes, 0);
+    guint n = json_array_get_length (episodes);
+    if (n > 0) {
+      gint idx = select_airing_index (episodes, "startTimestamp", target, FALSE);
+      if (idx < 0)
+        idx = (gint) (n - 1);
+      JsonObject *ep = json_array_get_object_element (episodes, idx);
       np->show_name = g_strdup (
         json_object_get_string_member_with_default (ep, "showName", NULL));
     }
